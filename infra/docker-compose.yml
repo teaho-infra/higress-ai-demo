@@ -1,0 +1,37 @@
+# Nacos + Higress — 本地 docker-compose
+# 仅本机,无鉴权,所有端口仅 127.0.0.1 绑定
+
+services:
+  nacos:
+    image: nacos-registry.cn-hangzhou.cr.aliyuncs.com/nacos/nacos-server:v2.5.3
+    container_name: nacos-standalone
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8848:8848"   # HTTP API + Console
+      - "127.0.0.1:9848:9848"   # gRPC server (节点间)
+      - "127.0.0.1:9849:9849"   # gRPC client RPC (Spring Cloud Alibaba 长连接)
+    environment:
+      - MODE=standalone
+      - PREFER_HOST_MODE=hostname
+      - NACOS_AUTH_ENABLE=false       # 本机 demo 不开鉴权
+      - JVM_XMS=512m
+      - JVM_XMX=512m
+      - JVM_XMN=256m
+    volumes:
+      - ./data/nacos:/home/nacos/data
+      - ./data/nacos/logs:/home/nacos/logs
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8848/nacos/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - higress-net
+
+  # Higress 段见 Task 2
+
+networks:
+  higress-net:
+    name: higress-net
+    driver: bridge
