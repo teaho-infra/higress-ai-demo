@@ -1,0 +1,42 @@
+server:
+  port: 8088
+  address: 127.0.0.1
+
+spring:
+  application:
+    name: spring-ai-demo
+  main:
+    web-application-type: servlet
+
+  ai:
+    openai:
+      # 指向豆包 Ark Coding 端点 (OpenAI 兼容)
+      # Key 通过 OPENAI_API_KEY 环境变量注入(不进 git)
+      api-key: ${OPENAI_API_KEY:dev-key-placeholder}
+      base-url: ${OPENAI_BASE_URL:https://ark.cn-beijing.volces.com/api/coding/v3}
+      chat:
+        # 实际可用的模型见 infra/ark-validation.md
+        # 优先 deepseek-v4-flash-ga-260731(快) 或 glm-5-2(强)
+        options:
+          model: ${OPENAI_MODEL:deepseek-v4-flash-ga-260731}
+          temperature: 0.7
+
+  # MCP client: stdio 模式,启动两个本地 Python MCP server
+  # (后续 Task 7b 一起配,这里先留空配置占位)
+  mcp:
+    client:
+      enabled: false  # Task 7b 改 true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: when-authorized
+
+logging:
+  level:
+    org.springframework.ai: INFO
+    com.example.aicuration: DEBUG
