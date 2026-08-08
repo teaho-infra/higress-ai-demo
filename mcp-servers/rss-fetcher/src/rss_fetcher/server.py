@@ -121,10 +121,11 @@ async def search_rss(
     return str(articles)
 
 
-async def main() -> None:
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
+# mcp SDK 2.0.0 high-level API: MCPServer.run("stdio") handles
+# stdio_server() + create_initialization_options() internally.
+def main() -> None:
+    app.run("stdio")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

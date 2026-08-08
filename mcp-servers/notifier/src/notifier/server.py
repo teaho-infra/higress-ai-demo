@@ -62,10 +62,6 @@ async def send_echo(body_md: str, title: str = "") -> str:
         return f"ERROR: {e!r}"
 
 
-async def main() -> None:
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
-
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    # High-level stdio run (mcp SDK 2.0): blocks, runs the asyncio loop internally
+    app.run("stdio")
