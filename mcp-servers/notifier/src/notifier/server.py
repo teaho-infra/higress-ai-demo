@@ -1,8 +1,8 @@
-"""notifier MCP server.
+"""notifier MCP server (mcp SDK 2.0.0 — high-level MCPServer decorator API).
 
-Exposes two webhook tools over the Model Context Protocol:
-- send_webhook(url, body_md, title?): POST markdown to any HTTP endpoint
-- send_echo(body_md, title?): POST to the configured local echo server
+Exposes two webhook tools:
+- send_webhook(url, body_md, title=""): POST markdown to any HTTP endpoint
+- send_echo(body_md, title=""): POST to the configured local echo server
 """
 
 from __future__ import annotations
@@ -12,21 +12,12 @@ import os
 from typing import Any
 
 import httpx
-from mcp.server import Server
+from mcp.server import MCPServer
 from mcp.server.stdio import stdio_server
-from mcp.types import (
-    CallToolRequest,
-    CallToolRequestParams,
-    CallToolResult,
-    ListToolsRequest,
-    ListToolsResult,
-    TextContent,
-    Tool,
-)
 
 ECHO_SERVER_URL = os.environ.get("ECHO_SERVER_URL", "http://localhost:9999/echo")
 
-app = Server("notifier")
+app = MCPServer("notifier")
 
 
 async def _post_json(url: str, payload: dict[str, Any], timeout: float = 10.0) -> dict[str, Any]:
@@ -39,100 +30,36 @@ async def _post_json(url: str, payload: dict[str, Any], timeout: float = 10.0) -
             return {"raw": r.text}
 
 
-async def _list_tools(req: ListToolsRequest) -> ListToolsResult:
-    return ListToolsResult(
-        tools=[
-            Tool(
-                name="send_webhook",
-                description=(
-                    "POST markdown text to any HTTP webhook URL. "
-                    "Returns the response (parsed JSON if possible, else raw text)."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "url": {"type": "string", "description": "Target webhook URL (http/https)."},
-                        "body_md": {"type": "string", "description": "Markdown body to send."},
-                        "title": {"type": "string", "description": "Optional title / subject."},
-                    },
-                    "required": ["url", "body_md"],
-                },
-            ),
-            Tool(
-                name="send_echo",
-                description=(
-                    f"POST markdown to the configured local echo server at {ECHO_SERVER_URL}. "
-                    "Used in this demo to verify the notification pipeline end-to-end."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "body_md": {"type": "string", "description": "Markdown body to send."},
-                        "title": {"type": "string", "description": "Optional title / subject."},
-                    },
-                    "required": ["body_md"],
-                },
-            ),
-        ]
-    )
+@app.tool()
+async def send_webhook(url: str, body_md: str, title: str = "") -> str:
+    """POST markdown text to any HTTP webhook URL.
 
-
-app.add_request_handler("tools/list", ListToolsRequest, _list_tools)
-
-
-async def _call_tool(req: CallToolRequest) -> CallToolResult:
-    name = req.params.name
-    arguments = req.params.arguments or {}
-
+    Returns a string describing the response (parsed JSON if possible, else raw text).
+    """
     try:
-        if name == "send_webhook":
-            url = arguments.get("url")
-            body_md = arguments.get("body_md")
-            title = arguments.get("title", "")
-            if not url or not body_md:
-                return CallToolResult(
-                    content=[TextContent(type="text", text="ERROR: url and body_md are required")],
-                    is_error=True,
-                )
-            payload = {"title": title, "body_md": body_md, "source": "notifier-mcp"}
-            result = await _post_json(url, payload)
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"OK: {result}")],
-                is_error=False,
-            )
-
-        if name == "send_echo":
-            body_md = arguments.get("body_md")
-            title = arguments.get("title", "")
-            if not body_md:
-                return CallToolResult(
-                    content=[TextContent(type="text", text="ERROR: body_md is required")],
-                    is_error=True,
-                )
-            payload = {"title": title, "body_md": body_md, "source": "notifier-mcp"}
-            result = await _post_json(ECHO_SERVER_URL, payload)
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"OK: {result}")],
-                is_error=False,
-            )
-
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"ERROR: unknown tool {name!r}")],
-            is_error=True,
-        )
+        payload = {"title": title, "body_md": body_md, "source": "notifier-mcp"}
+        result = await _post_json(url, payload)
+        return f"OK: {result}"
     except httpx.HTTPError as e:
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"ERROR: HTTP failure: {e!r}")],
-            is_error=True,
-        )
+        return f"ERROR: HTTP failure: {e!r}"
     except Exception as e:
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"ERROR: {e!r}")],
-            is_error=True,
-        )
+        return f"ERROR: {e!r}"
 
 
-app.add_request_handler("tools/call", CallToolRequest, _call_tool)
+@app.tool()
+async def send_echo(body_md: str, title: str = "") -> str:
+    """POST markdown to the configured local echo server.
+
+    Used in this demo to verify the notification pipeline end-to-end.
+    """
+    try:
+        payload = {"title": title, "body_md": body_md, "source": "notifier-mcp"}
+        result = await _post_json(ECHO_SERVER_URL, payload)
+        return f"OK: {result}"
+    except httpx.HTTPError as e:
+        return f"ERROR: HTTP failure: {e!r}"
+    except Exception as e:
+        return f"ERROR: {e!r}"
 
 
 async def main() -> None:

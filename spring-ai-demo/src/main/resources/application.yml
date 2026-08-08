@@ -21,11 +21,40 @@ spring:
           model: ${OPENAI_MODEL:deepseek-v4-flash-ga-260731}
           temperature: 0.7
 
-  # MCP client: stdio 模式,启动两个本地 Python MCP server
-  # (后续 Task 7b 一起配,这里先留空配置占位)
-  mcp:
-    client:
-      enabled: false  # Task 7b 改 true
+    # MCP client: stdio 模式,启动两个本地 Python MCP server
+    # CONFIG_PREFIX = "spring.ai.mcp.client"
+    # 顶层 enabled/type/name/version/... 在 mcp.client.common
+    # stdio.connections 是个 Map<String, Parameters(command, args, env)>
+    mcp:
+      client:
+        enabled: true
+        name: spring-ai-demo-mcp-client
+        version: 0.1.0
+        request-timeout: 30s
+        type: SYNC
+        stdio:
+          connections:
+            rss-fetcher:
+              command: /home/leonbook5/.hermes/bin/uv
+              args:
+                - run
+                - --project
+                - ${user.dir}/../mcp-servers/rss-fetcher
+                - python
+                - -m
+                - rss_fetcher.server
+              env: {}
+            notifier:
+              command: /home/leonbook5/.hermes/bin/uv
+              args:
+                - run
+                - --project
+                - ${user.dir}/../mcp-servers/notifier
+                - python
+                - -m
+                - notifier.server
+              env:
+                ECHO_SERVER_URL: ${ECHO_SERVER_URL:http://localhost:9999/echo}
 
 management:
   endpoints:
@@ -38,5 +67,5 @@ management:
 
 logging:
   level:
-    org.springframework.ai: INFO
+    org.springframework.ai: DEBUG
     com.example.aicuration: DEBUG
