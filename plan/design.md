@@ -1,0 +1,1 @@
+/home/leonbook5/.hermes/plans/2026-08-08_150851-higress-ai-demo-design.md

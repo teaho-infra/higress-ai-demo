@@ -1,0 +1,68 @@
+# =============================================
+# higress-ai-demo — gitignore
+# =============================================
+
+# --- Secrets / local config (NEVER commit) ---
+infra/.env
+.env
+*.env.local
+
+# --- Java / Maven ---
+target/
+*.class
+*.jar
+*.war
+*.ear
+.mvn/
+!.mvn/wrapper/maven-wrapper.jar
+.mvn/wrapper/maven-wrapper.properties
+.classpath
+.project
+.settings/
+.factorypath
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+nbproject/private/
+nbbuild/
+dist/
+nbdist/
+.nb-gradle/
+build/
+out/
+HELP.md
+
+# --- Python / uv ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.python-version
+uv.lock
+
+# --- Logs / temp ---
+*.log
+logs/
+tmp/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# --- Runtime data (Nacos/Higress volumes) ---
+infra/data/
+infra/.higress/
+infra/.nacos/
+infra/docker-compose.override.yml
+
+# --- Local IDE / Hermes ---
+.idea/
+*.swp
