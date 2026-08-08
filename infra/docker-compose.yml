@@ -31,6 +31,21 @@ services:
 
   # Higress 段见 Task 2
 
+  higress:
+    image: higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/all-in-one:latest
+    container_name: higress-ai
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8001:8001"   # Console (注:本机 8080 被 backend 容器占用,改用 8082)
+      - "127.0.0.1:8082:8080"   # Gateway HTTP — 容器内 8080, 主机 8082
+      - "127.0.0.1:8443:8443"   # Gateway HTTPS
+    volumes:
+      - ./data/higress:/data
+    environment:
+      - TZ=Asia/Shanghai
+    networks:
+      - higress-net
+
 networks:
   higress-net:
     name: higress-net

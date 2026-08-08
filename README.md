@@ -40,7 +40,7 @@ mvn spring-boot:run
 |---|---|---|
 | Nacos Console | 8848 | nacos/nacos |
 | Higress Console | 8001 | admin/admin |
-| Higress Gateway | 8080 | — |
+| Higress Gateway | **8082** (8080 被占) | — |
 | Higress Gateway(HTTPS) | 8443 | — |
 | Spring AI Demo | 8088 | — |
 | Echo server | 9999 | — |

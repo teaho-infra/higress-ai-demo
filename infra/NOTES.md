@@ -11,6 +11,6 @@
 
 ## Higress
 - 镜像: higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/all-in-one:latest
-- 端口: 8001 (Console) + 8080 (Gateway HTTP) + 8443 (Gateway HTTPS)
+- 端口: 8001 (Console) + 8082 (Gateway HTTP, 容器内 8080 — 本机 8080 被占) + 8443 (Gateway HTTPS)
 - 数据卷: ./data/higress
 - 容器名: higress-ai
