@@ -1,0 +1,38 @@
+# higress-ai-demo: minikube console deployment (source-built image)
+# Chart: higress-console/helm v2.1.0 (image v2.2.4)
+global:
+  local: true
+  ingressClass: "higress"
+
+image:
+  repository: higress-console/console
+  tag: v2.2.4
+  pullPolicy: IfNotPresent
+
+service:
+  type: NodePort
+  port: 8080
+
+ingress:
+  enabled: true
+  domain: console.higress.io
+  tlsSecretName: ""
+  annotations: {}
+  paths:
+    - path: /
+      pathType: Prefix
+
+o11y:
+  enabled: false
+
+grafana:
+  enabled: false
+
+prometheus:
+  enabled: false
+
+loki:
+  enabled: false
+
+certmanager:
+  enabled: false

@@ -112,14 +112,14 @@ backend ./mvnw package（Maven Wrapper，非系统 maven）  → console/target/
 - ✅ 检查点：java -jar 冒烟 `higress-console.jar --local` 能起；`minikube image list` 含 console
 
 ### Task 4 — Helm 部署（两个 chart，用本地镜像）
-- [ ] **chart A 主集群**：用 `higress/helm/core`（或 `helm repo add higress.io https://higress.cn/helm-charts`）：`helm show values` 先核对 `global.local`、`o11y.enabled`、`gateway`/`controller` `service.type=NodePort`+`nodePort`、`global.hub/tag`、`imagePullPolicy`
-- [ ] 写 `infra/minikube/higress-values.yaml`：local=true、o11y=false、NodePort 30080/30443/30001、`global.hub`/tag 指向本地镜像名 + `imagePullPolicy: IfNotPresent`（proxyv2 走 global.hub；若方案 A 拉发行则保持官方 hub）
-- [ ] 装 chart A：
+- [x] **chart A 主集群**：用 `higress/helm/core`（或 `helm repo add higress.io https://higress.cn/helm-charts`）：`helm show values` 先核对 `global.local`、`o11y.enabled`、`gateway`/`controller` `service.type=NodePort`+`nodePort`、`global.hub/tag`、`imagePullPolicy`
+- [x] 写 `infra/minikube/higress-values.yaml`：local=true、o11y=false、NodePort 30080/30443/30001、`global.hub`/tag 指向本地镜像名 + `imagePullPolicy: IfNotPresent`（proxyv2 走 global.hub；若方案 A 拉发行则保持官方 hub）
+- [x] 装 chart A：
   ```bash
   helm install higress -n higress-system --create-namespace \
     -f infra/minikube/higress-values.yaml <higress/helm/core 或 higress.io/higress>
   ```
-- [ ] 等 controller/gateway/内置 nacos 全 Running
+- [x] 等 controller/gateway/内置 nacos 全 Running
 - [ ] **chart B console**：用 `higress-console/helm`（独立 chart），`-f` 指向 console 本地镜像 tag；等 console Pod Running
 - ✅ 检查点：`kubectl -n higress-system get pods` 全 Running；`helm list -n higress-system` 两个都 deployed
 
@@ -178,9 +178,35 @@ backend ./mvnw package（Maven Wrapper，非系统 maven）  → console/target/
 - ❌ 不动 Tailscale Funnel / nginx / 宿主 443
 - ❌ 不删旧容器与 `~/himarket-data` 卷
 
-## 预估
-- Task 0–1：30–45min（Go + minikube + 镜像拉取）
-- Task 2–3：1.5–2.5h（controller 编译 + console Java/前端；mcp 缺失已由自定义 Dockerfile 绕开）
-- Task 4–6：1h
-- Task 7–8：1h 可选
-- **合计约半天**；可分段 commit，随时可回滚（`docker start higress`）。
+## 本环境专属踩坑（Task 1 实测，2026-09-17）
+
+## 🐛 坑：minikube 启动失败 `mark-control-plane: nodes "minikube" not found` / `Unable to register node`
+
+**症状**：kubelet 健康、apiserver/etcd/scheduler 全 Running，但 kubelet 报
+`Unable to register node with API server: Post https://192.168.49.2:8443/api/v1/nodes: proxyconnect tcp: dial tcp 127.0.0.1:7890: connection refused`
+
+**根因（三级定位，非时序竞争）**：
+1. 本机 **docker daemon 的 systemd 单元**强加代理：
+   ```
+   systemctl cat docker →
+     Environment=HTTP_PROXY=http://127.0.0.1:7890
+     Environment=HTTPS_PROXY=http://127.0.0.1:7890
+     Environment=NO_PROXY=127.0.0.0/8,172.16.0.0/12,10.0.0.0/8,localhost
+   ```
+2. minikube 用 docker 起节点容器时，docker 把**自己的** `HTTP(S)_PROXY`/`NO_PROXY` 强加进容器 env（优先级最高，覆盖 `--docker-env` 与 shell 的 unset）。
+3. 该 `NO_PROXY` **缺 minikube 集群 IP 网段 `192.168.49.0/24`**，导致 kubelet 带
+   `HTTPS_PROXY=http://127.0.0.1:7890` 去连内网 apiserver `192.168.49.2:8443`，走代理 → 连接被拒 → Node 注册失败 → mark-control-plane 找不到 node。
+
+**解法（方案 A，用户已确认）**：给 docker 加 systemd drop-in，只在 NO_PROXY 里**追加**集群网段：
+```bash
+sudo mkdir -p /etc/systemd/system/docker.service.d
+echo '[Service]' | sudo tee /etc/systemd/system/docker.service.d/minikube-noproxy.conf
+echo 'Environment=NO_PROXY=127.0.0.0/8,172.16.0.0/12,10.0.0.0/8,192.168.49.0/24,localhost' | sudo tee -a /etc/systemd/system/docker.service.d/minikube-noproxy.conf
+sudo systemctl daemon-reload
+sudo systemctl restart docker   # ⚠️ 重启所有在跑容器(except 2 wso2: restart=no)
+```
+重启后 minikube 需 `minikube delete -p minikube` + 重 `start`。
+
+**另一种思路（备选）**：不修 docker，改用 `minikube tunnel` / `kubectl port-forward` 暴露端口。会牺牲 `--ports` 的持久性。
+
+**通用教训**：本机 docker daemon 全局代理（systemd `Environment=`)会被注入到**每个**用 docker 起的容器。凡容器内组件需访问集群内部地址（kubelet→apiserver、容器→网关），token NO_PROXY 必须含这些内网网段，否则走代理必失败。
