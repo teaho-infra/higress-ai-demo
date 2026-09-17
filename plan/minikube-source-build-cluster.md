@@ -131,9 +131,9 @@ backend ./mvnw package（Maven Wrapper，非系统 maven）  → console/target/
 - ✅ 检查点：三端口行为与旧环境一致；截图/记录存 `infra/minikube/evidence/`
 
 ### Task 6 — 数据面链路验证（宿主 downstream 可达）
-- [ ] `wso2-demo-downstream:9081` 在跑；临时 test Pod 验证 `curl host.minikube.internal:9081/healthz`
-- [ ] 写 Ingress + Service + Endpoints 指向 `host.minikube.internal:9081`
-- [ ] `kubectl apply -f` → 等 xDS 生效（~10s）→ `curl 127.0.0.1:18080/demo/time` 200 → 删除 404
+- [x] `wso2-demo-downstream:9081` 在跑；临时 test Pod 验证 `curl host.minikube.internal:9081/healthz`
+- [x] 写 Ingress + Service + Endpoints 指向 `host.minikube.internal:9081`
+- [x] `kubectl apply -f` → 等 xDS 生效（~10s）→ `curl 127.0.0.1:18080/demo/time` 200 → 删除 404
 - ✅ 检查点：增/删收敛各一次，证据存 `infra/minikube/evidence/task6.txt`
 
 ### Task 7 — wso2 adapter 切 kubectl 通道（二期，可延后）
