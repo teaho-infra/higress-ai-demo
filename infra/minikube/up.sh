@@ -50,7 +50,8 @@ if ! minikube status >/dev/null 2>&1; then
 else
   log "minikube 已在运行"
 fi
-alias kc="minikube kubectl --"
+# 裸 kubectl 需可用(指向 minikube); 若不在 PATH 则用 minikube kubectl
+command -v kubectl >/dev/null || kubectl() { minikube kubectl -- "$@"; }
 
 # ---- 2. 确认源码镜像已 load(没有则提示) -----------------------------------
 log "检查本地源码镜像是否已注入 minikube ..."
