@@ -618,3 +618,72 @@ curl -o /dev/null -w '%{http_code}\n' https://leonbook5-jiguang-series.tailb1426
 - sub_filter_types 里重复写 text/html 会触发 nginx "duplicate MIME type" 警告(无害,但应去掉,HTML 默认已含)。
 - Browserbase 等远端无头浏览器连不到本机 localhost:8443,无法在此环境直接看 SPA 渲染;SPA 需用户本地/公网浏览器打开。
 - console 前端 API 路径为运行时相对/动态拼接,不依赖根路径字面量,挂前缀后经 sub_filter 的 /api/->/higress/api/ 即可正确代理。
+
+
+---
+
+## 实跑命令补记：console 挂 /higress 前缀的 404 修复（JS/CSS 与根路径 API，2026-09-18）
+
+> 承接上节:console 已挂 nginx /higress 前缀并经 Tailscale Funnel 暴露公网。但浏览器打开后
+> JS/CSS 404(动态 chunk 请求根路径 /js/xxx), 随后 /user/info 等 API 也 404。本节记录两轮根因与修复。
+
+### 第一轮:JS/CSS 404 —— nginx sub_filter 被上游 gzip 阻断
+
+**症状**:公网打开 higress console, 页面骨架出来但 JS/CSS 404。浏览器请求的是 `https://.../js/2209-xxx.js`(根路径,无 /higress 前缀)。
+
+**根因**:console 是无 basePath 的 ice SPA, HTML 静态 script 硬编码 `/js/...`、`/css/...`(根路径)。
+nginx 用 `sub_filter '/js/' '/higress/js/'` 等重写。但**浏览器发 `Accept-Encoding: gzip` → 上游(console/Envoy)返回 gzip 压缩体 → nginx sub_filter 无法在压缩内容上做文本替换** → HTML 里 script 保持 `/js/...` 根路径 → 浏览器请求根 `/js/xxx` 落到 multica catch-all → 404。
+(本地 curl 默认不带 gzip 所以明文、sub_filter 生效、验证通过,被误导;浏览器一开就暴露。)
+
+**修复**:`/higress/` location 加 `proxy_set_header Accept-Encoding "";` → 让上游返回明文, nginx 先 sub_filter 重写再(若开启 gzip)自行压缩。
+验证:公网带 gzip 请求现在返回明文且 script 已重写为 `/higress/js/...`, 全部 js/css 200。
+
+### 第二轮:根路径 API(`/user/info` 等) 404
+
+**症状**:登录/接口调用时 `https://.../user/info?ts=...` 404。
+
+**根因**:console 前端生产模式 API baseURL 为空串(`frontend/src/services/request.tsx`):
+`baseURL: process.env.ICE_CORE_MODE === "development" ? "/api" : ""`
+→ 生产模式前端按**当前 origin 根路径**发请求(`/user`、`/session`、`/system`、`/v1/`... 不带 /higress)。sub_filter 只改 HTML/JS 里**字面量**路径, 挡不住运行时拼接的根路径请求 → 落到 multica catch-all 404。
+
+**修复**:`higress-locations.conf` 加**根路径兜底 location**(console 的 API 命名空间, `^~` 前缀优先级高于 multica catch-all, 且 multica 无同名专门路由不冲突), 显式转发到 console:18080:
+```
+location ^~ /user/      { proxy_pass http://127.0.0.1:18080; proxy_set_header Host $host; }
+location ^~ /session/   { proxy_pass http://127.0.0.1:18080; ... }
+location ^~ /system/    { ... }
+location ^~ /dashboard/ { ... }
+location ^~ /v1/        { ... }
+location =  /landing    { proxy_pass http://127.0.0.1:18080/landing; ... }
+location =  /healthz    { proxy_pass http://127.0.0.1:18080/healthz; ... }
+# 注: /api 不设——multica 已占用 /api/(其根), console 的 /api 由 /higress/api/ 前缀处理。
+```
+
+### 最终 higress-locations.conf 结构(三层)
+
+```
+# A) /higress/ 前缀入口: proxy_pass http://127.0.0.1:18080/ (剥前缀) + sub_filter 重写根路径资源
+# B) 根路径 console API 兜底: 上述 ^~ location 转发到 console
+```
+
+- 配置文件: `~/.local/nginx/conf/higress-locations.conf`(仓库 infra/nginx/higress-locations.conf 备份)
+- reload: `nginx -s reload -c /home/leonbook5/.local/nginx/conf/nginx.conf`
+
+### 验证(全部通过)
+
+```
+# 第一轮: 公网全 js/css 200, HTML script 已重写为 /higress/js/
+curl -s https://leonbook5-jiguang-series.tailb1426a.ts.net/higress/ | grep -o 'src="/higress/js/[^"]*"' | head
+# 第二轮: 根路径 API 从 404 -> 401(未登录正常)/200/405(方法), 已到 console 后端
+curl -s -o /dev/null -w '%{http_code}\n' https://leonbook5-jiguang-series.tailb1426a.ts.net/user/info   # 401
+curl -s -o /dev/null -w '%{http_code}\n' https://leonbook5-jiguang-series.tailb1426a.ts.net/system/info # 200
+# multica/wso2 未破坏
+curl -s -o /dev/null -w '%{http_code}\n' https://leonbook5-jiguang-series.tailb1426a.ts.net/            # 200(multica)
+curl -s -o /dev/null -w '%{http_code}\n' https://leonbook5-jiguang-series.tailb1426a.ts.net/wso2         # 302(wso2)
+```
+
+### 踩坑
+
+- **sub_filter 与 gzip**:sub_filter 无法处理压缩体, 必须 `proxy_set_header Accept-Encoding ""` 让上游明文。此为两个 404 的根源之一。
+- **本地 curl 误导**:本地 curl 默认不带 Accept-Encoding:gzip, 一直是明文, sub_filter 总"看似生效"; 必须用 `curl -H 'Accept-Encoding: gzip'` 或真实浏览器验证。
+- **sub_filter 只管字面量**:ice/webpack 运行时由 publicPath 或相对请求拼接 URL, sub_filter 改不到 → 需 nginx 层显式兜底 location。
+- **/api 归属**:multica 已用根 /api/, 不把 /api 兜底到 console; console 的 /api 走 /higress/api/ 前缀即可。
