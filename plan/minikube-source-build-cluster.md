@@ -412,3 +412,145 @@ sleep 12    # 等 xDS 生效
 - 数据面：gateway 18080 → NodePort 30080 → Envoy :80 → Ingress → svc
 - 镜像：registry.local/higress/{higress,pilot,gateway}:2.2.4 + higress-console/console:v2.2.4 均在 minikube containerd
 - git 已提交 Task 1-6，本文件可回溯
+
+
+---
+
+## 实跑命令补记：gateway + pilot 全源码构建（2026-09-18）
+
+> 追加于前节之后。前置：前节 Task 1-6 已完成（controller/console 源码镜像已部署，gateway/pilot 当时为发行镜像 retag）。
+> 本节实现「所有组件全源码打包」：把 gateway(pilot) 也从 higress 源码组装，替换掉发行镜像。
+> 注意：Higress 官方 proxyv2 的 Envoy 二进制永远是**下载 Higress 预编译版**（higress-group/proxy 发行 tarball），
+> 不自编 Envoy；真正源码组装的是 istio 侧（pilot-discovery）+ 外围脚本（golang-filter、启动脚本、镜像组成）。
+
+### 关键前置破解：私有 build-tools 镜像其实公开可拉
+
+proxyv2/pilot 的 istio 构建容器镜像默认做法会以为它是私有的，实测发现是公开的，只需显式指定平台：
+
+```
+# 直接拉会 auth EOF(疑似多架构枚举问题)；显式 ——platform linux/amd64 则成功
+docker pull --platform linux/amd64 \
+  higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/build-tools:release-1.19-ef344298e65eeb2d9e2d07b87eb4e715c2def613
+# 本地 6.98GB (1.62GB 实际层)，这个 istio 编译环境是 proxyv2/pilot 组装的前提
+```
+
+### 环境变量必须在 make 前预置（脚本 set -u，缺一个就炸）
+
+`build-istio-image.sh` / `build-istio-pilot.sh` 都 `set -o pipefail` + 引用未绑定变量报错。
+用 make target（会从 Makefile 自动 export）最省事：HUB / TAG / HIGRESS_BASE_VERSION / ENVOY_PACKAGE_URL_PATTERN
+由 Makefile.core.mk 预置。手动跑脚本时需显式给全。
+
+### Step A — pilot 镜像（官方 istio 源码 build-linux 组装）
+
+```
+cd ~/IdeaProjects/agentspace/higress
+unset SSL_CERT_FILE CURL_CA_BUNDLE REQUESTS_CA_BUNDLE   # 否则 istio 容器内 curl 继承宿主 CA 路径报 77
+
+# 关键：out/ 会被之前容器 root 用户创建, 宿主 rm 不掉 → 先确认 out 归宿主(或让用户 sudo chown)
+# ls -ld external/istio/out 须为当前用户, 否则 make 开头 rm -rf out 权限失败
+
+# 1) 跑 pilot 组装(make target 自动带 HUB/TAG/ENVOY_URL)。会: 下载 Higgs 预编译 Envoy → 编 pilot-discovery → 生成 docker-bake.json
+make build-istio-local TARGET_ARCH=amd64 > /tmp/higress-pilot-build.log 2>&1
+# 结果: 编译/下载全成功("make complete"), 唯独最后用容器内 docker buildx bake 失败:
+#   client version 1.43 is too old. Minimum API 1.44  (build-tools 内 docker CLI 旧)
+# → 产物已在宿主 external/istio/out/linux_amd64/dockerx_build/, 直接用宿主动手打镜像
+
+# 2) 宿主动手：本地 base 需先 retag 成无 -amd64 后缀(供 Dockerfile FROM 解析)
+docker tag higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/base:2023-07-20T20-50-43-amd64 \
+           higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/base:2023-07-20T20-50-43
+cd external/istio/out/linux_amd64/dockerx_build/build.docker.pilot   # Dockerfile.pilot + amd64/pilot-discovery
+docker build --platform linux/amd64 \
+  -f Dockerfile.pilot \
+  --build-arg BASE_DISTRIBUTION=debug \
+  --build-arg BASE_VERSION=2023-07-20T20-50-43 \
+  --build-arg ISTIO_BASE_REGISTRY=higress-registry.cn-hangzhou.cr.aliyuncs.com/higress \
+  -t higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/pilot:58666ac985cee19a0a9a353421c63cead6d0cb47 \
+  .
+# → 得到源码 pilot 镜像, 含 /usr/local/bin/pilot-discovery (113MB)
+```
+
+### Step B — golang-filter（proxyv2 数据面 Go 过滤器，补进 external/package）
+
+`build-gateway-local` 会先编译 golang-filter，但官方走容器 `go mod tidy` 因容器内继承宿主代理(127.0.0.1:7890 指向宿主不通) + proxy.golang.org 失败。
+修法：宿主编译 + 国内 GOPROXY，再拷进 external/package。
+
+```
+cd ~/IdeaProjects/agentspace/higress/plugins/golang-filter
+export GOPROXY=https://goproxy.cn,direct GOFLAGS=-buildvcs=false
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy   # 关键：清代理
+go mod tidy     # 走 goproxy.cn, 成功
+go build -o golang-filter_amd64.so -buildmode=c-shared .   # 宿主 gcc 直接编出 .so (79MB)
+cp golang-filter_amd64.so ../../external/package/
+```
+
+### Step C — proxyv2 镜像（Higress 源码组装: 预编译 Envoy + golang-filter + pilot-agent）
+
+```
+cd ~/IdeaProjects/agentspace/higress
+unset SSL_CERT_FILE CURL_CA_BUNDLE REQUESTS_CA_BUNDLE
+# 需手动补 make 会预置的变量(脚本 set -u)：
+export HUB=higress-registry.cn-hangzhou.cr.aliyuncs.com/higress
+export TAG=58666ac
+export HIGRESS_BASE_VERSION=2023-07-20T20-50-43
+export ENVOY_PACKAGE_URL_PATTERN='https://github.com/higress-group/proxy/releases/download/v2.2.4/envoy-symbol-ARCH.tar.gz'
+export IMG_URL=""   # 脚本引用它, 空串即可
+
+TARGET_ARCH=amd64 DOCKER_TARGETS="docker.proxyv2" ./tools/hack/build-istio-image.sh docker \
+  > /tmp/higress-proxy-build.log 2>&1
+# 同样 "make complete", 卡在 build-tools 内 docker buildx(1.43)。产物已备齐:
+#   out/linux_amd64/dockerx_build/build.docker.proxyv2/{Dockerfile.proxyv2, amd64/{envoy, pilot-agent, golang-filter.so}}
+
+# 宿主动手 (必须 --network=host, 否则国内 apt 连 archive.ubuntu.com 超时 → Unable to locate package)
+cd external/istio/out/linux_amd64/dockerx_build/build.docker.proxyv2
+docker build --platform linux/amd64 --network=host \
+  -f Dockerfile.proxyv2 \
+  --build-arg BASE_DISTRIBUTION=debug \
+  --build-arg BASE_VERSION=2023-07-20T20-50-43 \
+  --build-arg ISTIO_BASE_REGISTRY=higress-registry.cn-hangzhou.cr.aliyuncs.com/higress \
+  --build-arg TARGETARCH=amd64 \
+  -t higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/proxyv2:58666ac \
+  .
+# → 源码 proxyv2 镜像, 含 envoy(815MB)+pilot-agent(27MB)+golang-filter.so(79MB)
+```
+
+### Step D — retag + load + 滚动替换
+
+```
+# 把源码镜像 retag 成 chart 期望名(chart 用 registry.local/higress/{pilot,gateway}:2.2.4)
+docker tag higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/pilot:58666ac985cee19a0a9a353421c63cead6d0cb47 \
+           registry.local/higress/pilot:2.2.4
+docker tag higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/proxyv2:58666ac \
+           registry.local/higress/gateway:2.2.4
+
+export PATH=$HOME/bin:$PATH
+minikube image load registry.local/higress/pilot:2.2.4
+minikube image load registry.local/higress/gateway:2.2.4
+
+# 因为 tag 没变, kubelet 不会自动重建 → 手动滚动重启
+minikube kubectl -- rollout restart deploy higress-gateway -n higress-system
+minikube kubectl -- rollout restart deploy higress-controller -n higress-system
+minikube kubectl -- rollout status deploy/higress-gateway -n higress-system --timeout=90s
+minikube kubectl -- rollout status deploy/higress-controller -n higress-system --timeout=120s
+
+# 验证 pod 镜像 ID = 源码版(36ab51b6dc11d=proxyv2 / adf888683e7b3=pilot), 数据面 200 正常
+minikube kubectl -- get pods -n higress-system
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18080/                       # console 200
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: demo.local' http://127.0.0.1:18080/demo/time  # downstream 200
+```
+
+### 最终四镜像全部源码（2026-09-18 达成）
+| 组件 | 镜像 | 构建方式 |
+|---|---|---|
+| controller | registry.local/higress/higress:2.2.4 | Go 源码 make docker-build |
+| pilot | registry.local/higress/pilot:2.2.4 | istio 源码头组装(宿主动手 docker build) |
+| gateway | registry.local/higress/gateway:2.2.4 | Higress 源码 proxyv2(预编译 Envoy + 源码 golang-filter) |
+| console | higress-console/console:v2.2.4 | Java+前端源码构建 |
+
+### 本期踩坑
+- 私有 build-tools 其实公开，docker pull 加 --platform linux/amd64 即可。
+- istio 容器内 curl 继承宿主 SSL_CERT_FILE → 必须 unset，否则下载 Envoy 报 (77)。
+- out/ 被容器 root 创建 → 宿主 rm 权限失败 → 需 sudo chown 归宿主。
+- build-istio-image.sh 手动跑要补 set -u 变量(HUB/TAG/HIGRESS_BASE_VERSION/ENVOY_PACKAGE_URL_PATTERN/IMG_URL)。
+- build-tools 内 docker CLI(1.43) 连宿主 daemon(1.53) 版本不符 → 绕开，直接在宿主动手 docker build bake 产物。
+- golang-filter 容器 go mod tidy 继承宿主 127.0.0.1 代理+proxy.golang.org → 清代理 + goproxy.cn 宿主编译。
+- proxyv2 镜像里 apt-get 装 logrotate/cron: 国内连 archive.ubuntu.com 超时 → docker build 加 --network=host。
