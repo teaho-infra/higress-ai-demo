@@ -554,3 +554,67 @@ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: demo.local' http://127.0.0.1:
 - build-tools 内 docker CLI(1.43) 连宿主 daemon(1.53) 版本不符 → 绕开，直接在宿主动手 docker build bake 产物。
 - golang-filter 容器 go mod tidy 继承宿主 127.0.0.1 代理+proxy.golang.org → 清代理 + goproxy.cn 宿主编译。
 - proxyv2 镜像里 apt-get 装 logrotate/cron: 国内连 archive.ubuntu.com 超时 → docker build 加 --network=host。
+
+
+---
+
+## 实跑命令补记：console 挂 nginx /higress 前缀 + Tailscale Funnel 外网暴露（2026-09-18）
+
+> 用户追加需求:把 console 经 nginx 加 /higress 路径前缀,开放到外网 Tailscale Funnel。
+> 前置:Higress console 已在 minikube 集群跑通,免 host `http://127.0.0.1:18080/` 可访问;
+> 本机已有用户级 nginx(`~/.local/nginx`,监听 :8443) + Tailscale Funnel 443->8443
+> (域名 leonbook5-jiguang-series.tailb1426a.ts.net),其上已挂 /multica 与 /wso2。
+
+### 关键问题:console 是无 basePath 的 ice SPA
+
+Higress console 前端(ice 脚手架)静态资源 `/css/`、`/js/` 与 API `/api/` 全部**硬编码在根路径**,
+不认 basePath。直接挂 `/higress/` 前缀并剥前缀会拿到 HTML,但 HTML 引用的 `/css/...` 经 nginx
+剥前缀打到 console 后路径变成 `/higress/css/...`(浏览器侧仍请求根 `/css/`, 而根 `/` 被 multica 占用)
+→ 资源 404,前端破裂。
+
+### 解法:nginx sub_filter 把根路径资源重写进 /higress/ 前缀
+
+`location /higress/` 用 `proxy_pass http://127.0.0.1:18080/`(带 URI → 自动剥 /higress/ 前缀),
+并对响应做 sub_filter 重写(HTML+JS):
+```
+sub_filter '/higress.jpg' '/higress/higress.jpg';
+sub_filter '/css/'        '/higress/css/';
+sub_filter '/js/'         '/higress/js/';
+sub_filter '/api/'        '/higress/api/';
+sub_filter_once off;
+sub_filter_types text/javascript application/javascript;   # HTML 默认已含
+```
+
+### 关键文件
+
+- `~/.local/nginx/conf/higress-locations.conf` — /higress/ location + sub_filter(本仓库 infra/nginx/ 有备份)
+- `~/.local/nginx/conf/nginx.conf` — include 该文件(第 151-152 行,wso2 include 之后)
+- 仓库 `infra/nginx/higress-locations.conf` + `infra/nginx/README.md` — 备份与说明
+
+改后 reload: `nginx -s reload -c /home/leonbook5/.local/nginx/conf/nginx.conf`
+
+### 验证(全部 200)
+
+```
+curl -o /dev/null -w '%{http_code}\n' https://leonbook5-jiguang-series.tailb1426a.ts.net/higress/                  # 200 text/html
+curl -o /dev/null -w '%{http_code}\n' https://leonbook5-jiguang-series.tailb1426a.ts.net/higress/css/main-*.css   # 200 text/css
+curl -o /dev/null -w '%{http_code}\n' https://leonbook5-jiguang-series.tailb1426a.ts.net/higress/js/data-loader.js # 200
+curl -o /dev/null -w '%{http_code}\n' https://leonbook5-jiguang-series.tailb1426a.ts.net/higress/api/             # 200
+# HTML 资源已重写为 /higress/ 前缀(可控)
+curl -s https://leonbook5-jiguang-series.tailb1426a.ts.net/higress/ | grep -o 'href="/higress/css/[^"]*"' | head
+# 未破坏其他服务
+curl -o /dev/null -w '%{http_code}\n' https://leonbook5-jiguang-series.tailb1426a.ts.net/                          # multica 200
+```
+
+### 访问地址
+
+- 公网: https://leonbook5-jiguang-series.tailb1426a.ts.net/higress/
+- 本地: http://127.0.0.1:8443/higress/
+- 直连 gateway 免 host: http://127.0.0.1:18080/
+
+### 踩坑/注意
+
+- sub_filter 只处理 text/* 默认;要重写 JS 里的路径须 `sub_filter_types text/javascript application/javascript`。
+- sub_filter_types 里重复写 text/html 会触发 nginx "duplicate MIME type" 警告(无害,但应去掉,HTML 默认已含)。
+- Browserbase 等远端无头浏览器连不到本机 localhost:8443,无法在此环境直接看 SPA 渲染;SPA 需用户本地/公网浏览器打开。
+- console 前端 API 路径为运行时相对/动态拼接,不依赖根路径字面量,挂前缀后经 sub_filter 的 /api/->/higress/api/ 即可正确代理。
