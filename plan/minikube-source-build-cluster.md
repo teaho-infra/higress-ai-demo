@@ -142,8 +142,8 @@ backend ./mvnw package（Maven Wrapper，非系统 maven）  → console/target/
 - 🟡 检查点：wso2 项目在新集群 E2E 通过
 
 ### Task 8 — 文档与固化（可选体验目标）
-- [ ] `infra/minikube/` 放 `up.sh` / `down.sh` / `reset.sh` / `values`
-- [ ] 更新 README 为「Minikube + 源码镜像」环境
+- [x] `infra/minikube/` 放 `up.sh` / `down.sh` / `reset.sh` / `values`
+- [x] 更新 README 为「Minikube + 源码镜像」环境
 - ✅ 检查点：新人可照文档 30 分钟重建
 
 ---

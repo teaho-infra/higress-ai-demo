@@ -272,3 +272,64 @@ higress-ai-demo/
   - Frontend: `himarket-web/himarket-frontend/`
   - 沙箱: `sandbox-shared`(`qodercli`/`qwen`/`claude-agent-acp`/`opencode`)
   - AGENTS.md: HiMarket 自己的 Agent 工作约束(自动注入上下文)
+
+---
+
+## 10. Minikube 源码构建环境（Higress 2.2.4 全源码镜像）
+
+> 本节描述一套**独立于 HiMarket docker 部署**的 Higress 环境：minikube 完整 K8s 集群 +
+> **全部组件（controller / pilot / gateway / console）本地源码构建镜像**。用于验证 Higress
+> 从源码到集群的完整链路，无外部镜像依赖（除基础工具镜像）。
+
+### 拓扑
+
+```
+宿主                                                        minikube 集群 (docker driver)
+┌─────────────────────────────┐   ┌───────────────────────────────────────────────┐
+│ 18080 ──► NodePort 30080 ─────┼──► higress-gateway (Envoy, 源码 proxyv2)         │
+│ 18443 ──► NodePort 30443 ─────┼──► higress-controller (源码) + pilot (源码 xDS)   │
+│ 18001 ──► NodePort 30001 ─────┼──► higress-console (Java+前端源码)                │
+│ host.minikube.internal:9081 ▲ └───────────────────────────────────────────────┘
+│   (宿主 downstream 容器)       │  Ingress(demo.local) → Endpoints 192.168.49.1:9081
+└─────────────────────────────┘
+```
+
+### 镜像来源（全部源码构建）
+
+| 组件 | 镜像 (my minikube 内) | 构建方式 |
+|---|---|---|
+| controller | `registry.local/higress/higress:2.2.4` | Go 源码 `make docker-build` |
+| pilot | `registry.local/higress/pilot:2.2.4` | istio 源码组装（宿主 docker build） |
+| gateway | `registry.local/higress/gateway:2.2.4` | Higress proxyv2 源码组装（预编译 Envoy + 源码 golang-filter） |
+| console | `higress-console/console:v2.2.4` | Java + 前端 `mvn` + 自定义 Dockerfile |
+
+详细构建步骤 & 踩坑见 [`plan/minikube-source-build-cluster.md`](plan/minikube-source-build-cluster.md)。
+
+### 一键脚本（在 `infra/minikube/`）
+
+```bash
+cd infra/minikube
+./up.sh      # 启动 minikube + 部署双 chart + 免 host 访问 console + 数据面路由
+./down.sh    # 停止 minikube（保留镜像/镜像/卷，可随时 up 恢复）
+./reset.sh   # 删除 minikube 集群（从零重建，无需改宿主 docker）
+```
+
+> 前置：minikube / helm / docker 已装；`~/.docker/config.json` 代理已修（把
+> `192.168.49.0/24`、`.aliyuncs.com` 加进 `noProxy`，否则 minikube 内 kubelet 拉镜像/连 apiserver
+> 走代理必失败）。源码镜像需先构建 + `minikube image load`（见 plan）。
+
+### 验证（创建后）
+
+```bash
+minikube kubectl -- get pods -n higress-system   # controller/gateway/console 全 Running
+curl http://127.0.0.1:18080/                     # console UI（免 host）→ 200
+curl -H 'Host: demo.local' http://127.0.0.1:18080/demo/time   # 数据面 → downstream 200
+```
+
+### 端口约定（宿主 → NodePort）
+
+| 端口 | 说明 |
+|---|---|
+| **18080 → 30080** | Higress Gateway HTTP + Console（经 default Ingress 免 host） |
+| **18443 → 30443** | Higress Gateway HTTPS |
+| **18001 → 30001** | Higress Console NodePort（备用，主用 18080 Ingress） |
