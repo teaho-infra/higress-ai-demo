@@ -687,3 +687,39 @@ curl -s -o /dev/null -w '%{http_code}\n' https://leonbook5-jiguang-series.tailb1
 - **本地 curl 误导**:本地 curl 默认不带 Accept-Encoding:gzip, 一直是明文, sub_filter 总"看似生效"; 必须用 `curl -H 'Accept-Encoding: gzip'` 或真实浏览器验证。
 - **sub_filter 只管字面量**:ice/webpack 运行时由 publicPath 或相对请求拼接 URL, sub_filter 改不到 → 需 nginx 层显式兜底 location。
 - **/api 归属**:multica 已用根 /api/, 不把 /api 兜底到 console; console 的 /api 走 /higress/api/ 前缀即可。
+
+
+---
+
+## 实跑命令补记：console 挂 /higress 前缀 · 第5轮 · basename/publicPath 白屏根治（2026-09-20）
+
+**现象**：在前端 401→登录跳转已正确（/login?redirect= → /higress/login）后，/higress/login 仍是白屏（ice-container 空，登录组件不渲染）。
+
+**根因**：console 是无 basePath 的 ice3 SPA。前端 router 硬编码在根路径（`/login` `/dashboard` 等，见 `_defaultProps.tsx`），
+`matchRoutes(routes, location=`/higress/login`, basename=/)` 匹配不到 `/login` 路由 → 返回空 → 白屏。
+nginx sub_filter 只能修**静态资源路径**（/js/ /css/）+ 根路径 API 兜底，**修不了前端 router 的路径匹配**（运行时 JS 逻辑）。
+
+**修复（改前端源码，根治）**：
+1. `frontend/ice.config.mts` 加 `publicPath: "/higress/"`（静态资源直接带前缀；`basename` 顶层键会被本版 build-scripts 拒绝 → 改放 src/app.ts）。
+2. `frontend/src/app.ts` 的 `defineAppConfig` 加 `router: { basename: "/higress" }`（@ice/runtime 支持 AppConfig.router.basename，见 node_modules/@ice/runtime/esm/types.d.ts）。
+3. `frontend/src/services/request.tsx:58` 401 整页跳转由硬编码 `/login?redirect=…` 改为 `${basePath}/login?redirect=…`，basePath=`/higress`（否则 401 仍跳根 /login 落 multica）。
+
+**验证（编译产物）**：`assets-manifest.json` publicPath=`/higress/`；`index.html` script src=`/higress/js/…`；main JS 含 `router:{basename:"/higress"}`。
+
+**重建 console 镜像**：
+- 前端 `NODE_OPTIONS=--openssl-legacy-provider npm run build`（老前端 webpack5）
+- 后端 `./mvnw clean package -Dmaven.test.skip=true -Dpmd.language=en`（前端产物经 maven-resources-plugin 拷进 static 打包）+ 自定义 Dockerfile（`backend/Dockerfile.custom`，FROM eclipse-temurin:21-jdk，绕开官方 Dockerfile 的 tools/mcp COPY 缺失）
+- `docker build -t higress-console/console:v2.2.4 -f Dockerfile.custom .` → `minikube image load higress-console/console:v2.2.4` → `kubectl rollout restart deployment/higress-console -n higress-system`
+
+**nginx 配置联动（关键）**：前端 publicPath 生效后 HTML/JS 已自带 `/higress/` 前缀 → nginx `/higress/` location 里原来的 sub_filter（`/js/→/higress/js/` `css` `api` `user/session/...`）**必须移除**，否则会双重前缀（`/higress/js/…` 又被替换成 `/higress/higress/js/…` → 404）。
+保留：`location = /higress`（301 https）、`location /higress/`（proxy_pass 剥前缀，去 sub_filter）、`= /healthz`、`= /landing`、`location = /login`（redirect 含 /higress 时 302 回 /higress/login）、`^~ /user/ /session/ /system/ /dashboard/ /v1/` 根路径 API 兜底。
+
+**最终结果（Browserbase 真实浏览器验证）**：
+- URL 正确跳到 `/higress/login?redirect=/higress/`（不再丢前缀，basename+request.tsx 生效）
+- ice-container 渲染出登录表单（inputs=4，`登 录` 按钮，`<form>` 存在）—— **白屏根治**
+- unhandledrejection `401 /user/info` 是未登录预期，前端靠它跳登录，非问题
+- 登录凭据：默认 `admin / admin`（`SystemConfigKey.DASHBOARD_USERNAME/PASSWORD_DEFAULT="admin"`）
+
+**本轮踩坑**：
+- `basename` 不能放 ice.config.mts 顶层（build-scripts 校验拒绝 `[Config File] Config key 'basename' is not supported`） → 放 `defineAppConfig.router.basename`
+- sub_filter 与前端 publicPath 会**双重加前缀** → publicPath 后用全量移除非 /higress 前缀需保留的 sub_filter
