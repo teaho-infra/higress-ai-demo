@@ -3,10 +3,13 @@
 > **读者**：刚入门的 AI/API 网关开发，会用 `curl`、看得懂 YAML，K8s/Envoy 零基础也没关系。
 > **目标**：① 建立 Higress 整体架构心智模型；② 按路线系统学习；③ **掌握一套可复用的方法，
 > 独立定位「higress-controller 与 higress-gateway 交互失败/报错」类问题**。
-> **配套阅读**：`bookspace/book_notes/notes_docs/blogs/ainotes/higress-gateway/higress-gateway.md`（学习笔记，本文在其基础上强化了架构与排障部分）。
+> **本机环境（2026-09 实测）**：minikube v1.39.0 + Kubernetes v1.37.0 + Higress v2.2.4
+> **全部源码构建**（controller/pilot/gateway/console 四镜像），双 chart 部署于 `higress-system` 命名空间。
+> 构建与部署全记录见 [`plan/minikube-source-build-cluster.md`](minikube-source-build-cluster.md)。
+> **配套阅读**：`bookspace/book_notes/notes_docs/blogs/ainotes/higress-gateway/higress-gateway.md`（学习笔记）。
 >
-> 本文命令分两种形态给出：**standalone**（本机 all-in-one 容器 `higress`）与 **K8s**（minikube + Helm）。
-> 标注「本机实测」的内容均来自 2026-09 本仓库真实环境。
+> 文中标注「本机实测」的命令均在本环境验证过。**minikube 集群用 `minikube start` 启动后再操作**；
+> 集群未启动时 kubectl 会报 `dial tcp 192.168.49.2:8443: no route to host`（这不是故障，见 2.6）。
 
 ---
 
@@ -33,22 +36,20 @@
 **「controller 和 gateway 交互失败」先看什么（30 秒分诊）：**
 
 ```bash
-# standalone（本机 all-in-one 容器）
-docker exec higress ps aux | grep -E 'pilot-discovery|envoy'   # 两个进程都在吗？
-docker exec higress ss -ltnp | grep -E '15010|15012|15051|80'  # xDS 和网关端口在听吗？
-tail -80 /var/log/higress/gateway.log   # 经 docker exec higress 执行；看最后一条 error
-curl -s http://127.0.0.1:18080/ -o /dev/null -w '%{http_code}\n'  # 000=端口无人监听
+# 0) 集群在跑吗？（minikube 停止时所有 kubectl 都会 no route to host）
+minikube status                                    # host/kubelet/apiserver 应为 Running
 
-# K8s（minikube）
-kubectl -n higress-system get pods                              # controller/gateway 都 Ready 吗？
-kubectl -n higress-system logs deploy/higress-controller --tail=100
-kubectl -n higress-system logs <gateway-pod> -c istio-proxy --tail=100
+kubectl -n higress-system get pods                 # controller/gateway/console 都 Running 吗？
 kubectl -n higress-system get events --sort-by=.lastTimestamp | tail -20
+kubectl -n higress-system logs deploy/higress-controller -c discovery --tail=100   # pilot(xDS server)
+kubectl -n higress-system logs <gateway-pod> -c gateway --tail=100                 # gateway/Envoy 侧
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18080/   # 000=端口无人监听
 ```
 
-> **本机实测（2026-09-27）**：当前容器 `higress` 处于 `unhealthy`——`pilot-discovery`（controller 侧）
-> 正常、Console 18001 返回 200，但 **Envoy 进程已不存在**，18080 返回 `000`。根因是
-> `too many open files`（详见 [2.5 实战复盘](#25-实战复盘本机-2026-09-25-故障too-many-open-files)）。
+> 本环境 Pod/容器命名（本机实测，以 `kubectl -n higress-system get pods -o wide` 为准）：
+> `higress-controller-xxx`（2 个容器：`higress` 控制面 core + `discovery` 即 pilot-discovery）、
+> `higress-gateway-xxx`（容器名 `gateway`，内含 pilot-agent + envoy）、`higress-console-xxx`。
+> 看日志务必用 `-c` 指定容器，否则报 "a container name must be specified"。
 
 ---
 
@@ -58,30 +59,31 @@ kubectl -n higress-system get events --sort-by=.lastTimestamp | tail -20
 
 ```
 客户端
-  │  HTTP / HTTPS
+  │  HTTP / HTTPS（宿主 18080/18443 ← minikube --ports 映射 ← NodePort 30080/30443）
   ▼
 ┌───────────────────────────────────────────────────────┐
 │  控制面 Control Plane（不转发业务流量）                  │
 │                                                       │
-│  配置输入：K8s Ingress / Gateway API / Istio CRD /      │
-│           Nacos / Console UI                          │
+│  配置输入：kubectl apply 的 Ingress / Gateway API /     │
+│           Istio CRD / Console UI                      │
 │                          │                            │
 │              ┌───────────▼────────────┐               │
-│              │ higress-controller      │  监听资源，     │
-│              │ （higress core，Go）    │  翻译生成统一   │
+│              │ higress-controller      │  watch 资源，   │
+│              │ Pod 容器1: higress core │  翻译生成统一   │
 │              │  :8888/debug/configz    │  配置模型       │
 │              └───────────┬────────────┘               │
-│                          │ MCP over xDS               │
+│                          │ MCP over xDS（同 Pod 内）   │
 │              ┌───────────▼────────────┐               │
-│              │ pilot-discovery (Istio) │  计算每个       │
-│              │  xDS gRPC :15010/:15012 │  Envoy 的最终  │
-│              │  debug :15014           │  配置并推送     │
+│              │ Pod 容器2: discovery     │  计算每个       │
+│              │ (pilot-discovery)       │  Envoy 的最终  │
+│              │  xDS gRPC :15010/:15012 │  配置并推送     │
+│              │  debug :15014           │                │
 │              └───────────┬────────────┘               │
 └──────────────────────────┼────────────────────────────┘
                            │ xDS（ADS 聚合 gRPC 流，LDS/RDS/CDS/EDS）
-                           ▼
+                           ▼  经 Service higress-controller:15012
 ┌───────────────────────────────────────────────────────┐
-│  数据面 Data Plane = higress-gateway                   │
+│  数据面 Data Plane = higress-gateway Pod               │
 │                                                       │
 │  pilot-agent（守护/引导）                               │
 │      └─ Envoy：listener → route → cluster → endpoint   │
@@ -92,41 +94,50 @@ kubectl -n higress-system get events --sort-by=.lastTimestamp | tail -20
           上游业务服务              LLM Provider / MCP Server
 ```
 
-**一次配置变更的旅程**：你在 Console/CRD 提交一条路由 → controller watch 到事件、
-翻译成内部配置 → 经 MCP over xDS 同步给 pilot-discovery → pilot 计算增量、
-通过 xDS gRPC 流推给所有已连接的 Envoy → Envoy 在 **1～15 秒内**热加载生效。
+**一次配置变更的旅程**：你 `kubectl apply` 一条路由（或 Console 提交）→ controller watch 到事件、
+翻译成内部配置 → 经 MCP over xDS 同步给同 Pod 的 pilot-discovery → pilot 计算增量、
+通过 xDS gRPC 流推给 gateway Pod 里的 Envoy → Envoy 在 **1～15 秒内**热加载生效。
 
-### 1.2 Higress 的三个身份与两种部署形态
+### 1.2 Higress 的三个身份与部署形态
 
 - **三个身份合一**：Ingress 网关（替代 Nginx Ingress，南北向）、服务网格网关
   （东西向治理：限流/熔断/灰度）、**AI 网关**（多模型路由、Key 管理、Token 限流、语义缓存——当前主线）。
-- **内核**：Envoy + Istio（Istio 的 pilot-discovery 保留，Istio Pilot 上游那部分重写为 Higress Controller），
+- **内核**：Envoy + Istio（保留 Istio 的 pilot-discovery，把上游重写为 Higress Controller），
   兼容 K8s Ingress / Gateway API / Istio CRD，并支持 Nacos 作为非 K8s 配置源。
+- Higress 官方另提供 all-in-one 单容器（standalone）形态，适合无 K8s 的快速体验；
+  **本环境不使用**，本文一律以 K8s（minikube）形态讲解，standalone 内容见官方文档。
 
-| | **standalone all-in-one**（本机现有） | **K8s Helm**（minikube 迁移目标） |
-|---|---|---|
-| 部署物 | 单容器，supervisord 管 6+ 进程 | controller Deployment + gateway Pod + console + 内置 Nacos |
-| 配置入口 | Console / Nacos / 容器内 `/data/*.yaml` | `kubectl apply`（Ingress/CRD）/ Console |
-| xDS 链路 | 全部走容器内 loopback | gateway Pod → controller Service（默认同 Pod sidecar/同节点） |
-| 适合 | 学习、PoC、无 K8s 环境 | 生产、标准实验环境 |
-| 文档 | [docker-compose 独立部署](https://higress.cn/docs/latest/ops/deploy-by-docker-compose/) | [Helm 云原生部署](https://higress.cn/docs/latest/ops/deploy-by-helm/) |
+### 1.3 本机集群组件地图（本机实测，2026-09）
 
-### 1.3 all-in-one 容器进程地图（本机实测，2026-09）
+minikube（docker driver）单节点，namespace `higress-system`，由两个 Helm chart 部署
+（core：`higress/helm/core`；console：`higress-console/helm`）：
 
-容器 `higress`（镜像 `higress/all-in-one`）内由 supervisord 拉起：
+| Pod | 容器 | 角色 | 关键端口 |
+|---|---|---|---|
+| `higress-controller-xxx` | `higress` | 控制面 core：watch 资源、翻译配置、对 pilot 提供配置 | 8888（debug configz） |
+| 同上 | `discovery` | pilot-discovery：xDS server，向 Envoy 下发 LDS/RDS/CDS/EDS | **15010/15012**（gRPC）、**15014**（debug）、15080 |
+| `higress-gateway-xxx` | `gateway` | 数据面：pilot-agent + envoy | 80/443（业务）、15000（admin）、15020（status） |
+| `higress-console-xxx` | console | Console 后端 + 前端 | 8080 |
 
-| 进程 | 角色 | 关键端口 |
-|---|---|---|
-| `nginx` | Console/前端的入口反代 | 容器 8002（宿主 18001→8001 走 java） |
-| `apiserver` | standalone 内置的「类 K8s APIServer」，承载本地资源对象 | 127.0.0.1:18443 |
-| `higress serve`（**controller core**） | watch 资源、翻译配置、对 pilot 提供配置 | 8888 / 8889 / 15051 |
-| `pilot-discovery discovery`（**Istio Pilot**） | xDS server，向 Envoy 下发 LDS/RDS/CDS/EDS | **15010/15012**（gRPC）、**15014**（debug）、15080（HTTP） |
-| `pilot-agent + envoy`（**gateway**） | 数据面；pilot-agent 生成 bootstrap、守护 Envoy | 80/443（业务）、15000（admin）、15020（status） |
-| `java -jar higress-console.jar` | Console 后端（路由/插件 UI） | 8001 |
-| `plugin-server` | 进程外插件服务 | — |
+端口链路（本机实测）：宿主 **18080** → minikube `--ports` 映射 → NodePort **30080** → gateway Envoy:80；
+宿主 **18443** → NodePort **30443** → Envoy:443；宿主 **18001** → NodePort **30001** → console Service:8080。
+另外 core chart 的 `default` Ingress 已 patch 为根路径直指 console Service，所以
+**`http://127.0.0.1:18080/` 免 Host 头直接打开 Console UI**（Task 5 实测）。
 
-启动顺序由 supervisord `priority` 与脚本内等待控制：`start-gateway.sh` 里有 **`waitForPilot`**
-——gateway 必须等 pilot 就绪才启动。这解释了一类启动时序故障（见 2.6）。
+镜像（源码构建产物，已 `minikube image load` 进节点 containerd，`imagePullPolicy: IfNotPresent`）：
+`registry.local/higress/higress:2.2.4`（controller）、`registry.local/higress/pilot:2.2.4`、
+`registry.local/higress/gateway:2.2.4`（proxyv2 数据面）、`higress-console/console:v2.2.4`。
+⚠️ 若 Pod 起不来且日志提示拉镜像失败，先 `minikube ssh -- sudo crictl images | grep higress`
+确认镜像在节点内；retag 规则见 [`minikube-source-build-cluster.md`](minikube-source-build-cluster.md) Task 4。
+
+常用日常命令：
+
+```bash
+minikube start          # 启动集群（路由与端口自动恢复）
+minikube stop           # 停止（省资源；kubectl 会暂时连不上，属预期）
+minikube kubectl -- get pods -n higress-system   # 集群内自带 kubectl
+minikube dashboard      # 可选：Web 控制台
+```
 
 ### 1.4 数据面四件套 ↔ xDS 对应关系
 
@@ -135,35 +146,30 @@ kubectl -n higress-system get events --sort-by=.lastTimestamp | tail -20
 | Listener | 监听端口（80/443）及过滤链 | 网关 Deployment/全局配置 | **LDS** |
 | Route | 域名+路径 → 上游的规则、虚拟主机 | Ingress / IngressRoute | **RDS** |
 | Cluster | 一个上游服务的连接池、LB 策略、熔断 | McpBridge / Service / 静态 DNS | **CDS** |
-| Endpoint | Cluster 后的具体 IP:Port 列表 | Nacos / K8s Endpoints / 静态 | **EDS** |
+| Endpoint | Cluster 后的具体 IP:Port 列表 | K8s Endpoints / Nacos / 静态 | **EDS** |
 
 请求路径：`listener 收到 → HCM 过滤链 → 命中 route → 找到 cluster → 挑一个 endpoint → 发出`。
+
+> 本机实测注意（K8s 下最常踩）：**必须建了 Ingress，controller 才会向 Envoy 下发 HTTP 监听**。
+> 没有任何 Ingress 时 18080 返回 404 是正常的（空网关），不是故障。
 
 ### 1.5 xDS 协议深入（排障必须理解的细节）
 
 - xDS 是一套 **gRPC 流式订阅协议**。每个 xDS 接口都是「Envoy 发起请求（订阅资源）↔ server 流式返回」。
-- **ADS（Aggregated Discovery Service）**：把 LDS/RDS/CDS/EDS 复用到**一条 gRPC 双向流**上
-  （`/envoy.service.discovery.v3.AggregatedDiscoveryService/DeltaAggregatedResources` 或 SotW 版本），
-  保证多种资源的更新顺序。Higress 默认走 ADS，端点 15010（plain）/15012（mTLS）。
+- **ADS（Aggregated Discovery Service）**：把 LDS/RDS/CDS/EDS 复用到**一条 gRPC 双向流**上，
+  保证多种资源的更新顺序。Higress 默认走 ADS；本环境中 gateway 经 Service
+  `higress-controller:15012`（mTLS）/15010（plain）连接 pilot。
 - **SotW vs Delta**：SotW（State of the World）每次推全量；Delta xDS 只推增减。版本演进中两种都可能出现。
 - **ACK/版本号机制**：每个 Response 带 `version_info`，Envoy 处理完后在下次 Request 里回带该版本号 +
   `response_nonce`；server 靠 nonce 判断上次推送是否被接受。**Envoy 拒绝配置时会回 `error_detail`**——
   这是定位「配置下发了但不生效」的关键信号（在 pilot 日志里搜 `NACK`/`rejecting`）。
-- standalone 中 gateway 的 bootstrap（本机实测，`gateway.log` 里打印的 mesh config）：
-  - `discoveryAddress: 127.0.0.1:15012`，`controlPlaneAuthPolicy: MUTUAL_TLS`；
-  - `configSources: xds://127.0.0.1:15051` 与 `k8s://`；`PROXY_XDS_VIA_AGENT=true`（经 pilot-agent 中转）；
-  - `serviceCluster: higress-gateway`，`rootNamespace: higress-system`。
-- Envoy 启动时先加载**静态 bootstrap**（listener/admin/ADS cluster），连上 ADS 后，后续一切配置皆动态。
-
-### 1.6 证书与信任
-
-- standalone 首次启动时 `start-pilot.sh initCerts` 用 OpenSSL 自签生成 `/etc/certs/`
-  （`root-cert.pem`、`cert-chain.pem`、`ca-key.pem` 等，有效期 36500 天），pilot 与 gateway 共用，
-  xDS 走 **mTLS**。
-- 排障含义：证书文件缺失/损坏/被换 → xDS 握手失败，Envoy 拿不到任何配置（见 2.6 模式②）。
+- gateway 的 bootstrap 由 pilot-agent 生成（`configPath: ./etc/istio/proxy`），启动时先加载
+  静态 bootstrap（admin/ADS cluster），连上 ADS 后，后续一切配置皆动态。
+- **证书与信任**：K8s 形态下 pilot 与 gateway 间的 mTLS 证书由控制面签发轮换（无需手工管理）；
+  但宿主时间被重置、Secret `higress-system/certs` 异常仍会导致 xDS 握手失败，
   日志特征：`certificate verify failed`、`SSLV3_ALERT`、`auth handshake error`。
 
-### 1.7 Wasm 插件在链路中的位置
+### 1.6 Wasm 插件在链路中的位置
 
 ```
 请求:  requestHeaders → requestBody
@@ -188,8 +194,8 @@ kubectl -n higress-system get events --sort-by=.lastTimestamp | tail -20
 
 | 层 | 典型问题 | 一眼指标 |
 |---|---|---|
-| **L1 进程层** | Envoy/pilot/controller 进程挂了、OOM、启动即崩、supervisord FATAL | `ps` 缺进程、Pod 非 Running、容器 unhealthy |
-| **L2 网络/证书层** | xDS 端口不通、DNS/Service 错、mTLS 证书坏、NetworkPolicy/防火墙 | `ss/telnet` 不通、握手失败日志 |
+| **L1 进程层** | Pod 重启/崩溃、容器 OOMKilled、镜像拉取失败、探针失败 | `get pods` 非 Running、`describe pod` 有事件 |
+| **L2 网络/证书层** | xDS Service 不通、mTLS 证书异常、NetworkPolicy 拦截 | 握手失败日志、`certificate verify failed` |
 | **L3 xDS 会话层** | ADS 连接建立但断开/重连、Envoy NACK、版本不匹配 | pilot 日志的 connect/disconnect/**NACK**、`/debug/connections` |
 | **L4 配置翻译层** | 资源没被 watch 到、ingressClassName 不符、McpBridge/Nacos 源错、转换被忽略 | `configz` 里没有该资源、controller 日志 warn |
 | **L5 上游/流量层** | xDS 全正常，但路由 404/503/超时：无 endpoint、Strip 前缀、TLS 到上游 | Envoy `config_dump` 正常但请求失败、access log `response_flags` |
@@ -201,16 +207,18 @@ kubectl -n higress-system get events --sort-by=.lastTimestamp | tail -20
 
 | 症状 | 最可能层 | 先做什么 |
 |---|---|---|
-| 容器 `unhealthy`，curl 网关 `000`（连接拒绝） | L1 | 查进程与 `gateway.log` 最后一条 error |
-| Console 能开，网关没响应 | L1 | Console 是 java，挂了也不影响；单查 Envoy 进程 |
-| Pod `CrashLoopBackOff` | L1 | `kubectl logs --previous` 看上次崩溃原因 |
+| kubectl 全部 `no route to host` | 非故障 | `minikube status`；集群没起，`minikube start` |
+| gateway Pod 非 Running / 反复重启 | L1 | `describe pod` + `logs --previous` |
+| Pod ImagePullBackOff | L1（镜像） | `crictl images`；源码镜像未 load / tag 不对（见 1.3） |
+| 18080 返回 000（连接拒绝） | L1 | gateway Pod 状态；NodePort 30080 是否存在 |
+| 18080 一直 404（有路由也 404） | L4/L5 | 三段 configz 比对；查 Ingress 的 Host 与 ingressClassName |
 | 日志反复 `StreamAggrResources ... close`、重连 | L2/L3 | 查 15010/15012 连通与证书 |
-| `xds: connection termination` / `certificate verify failed` | L2 | 查 `/etc/certs`、时间是否被重置 |
+| `xds: connection termination` / `certificate verify failed` | L2 | 查证书 Secret、节点时间 |
 | pilot 日志出现 `NACK` / `rejecting configuration` | L3/L4 | 看 NACK 的 error_detail，多为 Envoy 版本不支持该配置 |
-| 路由在 Console 列表里，但请求 404 | L4/L5 | configz 三段比对；查域名/Host 头匹配 |
-| 请求返回 503 `no healthy upstream` | L5 | 查 EDS endpoint、健康检查、McpBridge/Nacos 实例 |
+| 路由在 Console/CRD 里存在，但请求 404 | L4/L5 | configz 三段比对；查域名/Host 头匹配 |
+| 请求返回 503 `no healthy upstream` | L5 | 查 EDS endpoint、`/clusters` 健康标记、Endpoints 对象 |
 | 配置改了，十几秒还不变 | 非故障 | xDS 秒级延迟（10–15s），轮询等待再断言 |
-| K8s apply 了 Ingress，完全无反应 | L4 | 是否带 `ingressClassName: higress`；namespace 是否被 watch |
+| `kubectl apply` 了 Ingress，完全无反应 | L4 | 是否带 `ingressClassName: higress`；namespace 是否正确 |
 | Envoy 启动报 `too many open files` | L1 | 见 2.5 实战复盘 |
 
 ### 2.3 工具箱：三段 Debug 端点（配置链路逐段截查）
@@ -219,40 +227,49 @@ kubectl -n higress-system get events --sort-by=.lastTimestamp | tail -20
 **在哪段断了，问题就在哪段的上游侧**：
 
 ```bash
-# K8s：先 kubectl exec -n higress-system 进 controller Pod；standalone：docker exec -it higress sh
+CP=$(kubectl -n higress-system get pod -l app=higress-controller -o name)   # 本机实测可用
+GW=$(kubectl -n higress-system get pod -l app=higress-gateway -o name)
 
 # ① controller 生成的全量配置（没有你的路由 → 问题在 L4：资源没被 controller 接收/翻译）
-curl -s 'http://127.0.0.1:8888/debug/configz?pretty' | less
+kubectl -n higress-system exec $CP -c higress -- \
+  curl -s 'http://127.0.0.1:8888/debug/configz?pretty' | less
 
 # ② pilot 从 controller 收到的配置（①有②无 → controller→pilot 的 MCP over xDS 有问题）
-curl -s 'http://127.0.0.1:15014/debug/configz?pretty' | less
+kubectl -n higress-system exec $CP -c discovery -- \
+  curl -s 'http://127.0.0.1:15014/debug/configz?pretty' | less
 
 # ② 查看当前与各 Envoy 的 xDS 连接（看不到 gateway 连接 → L2/L3：Envoy 没连上或被断开）
-curl -s 'http://127.0.0.1:15014/debug/connections'
+kubectl -n higress-system exec $CP -c discovery -- \
+  curl -s 'http://127.0.0.1:15014/debug/connections'
 # 取 connectionId(proxyID)，查 pilot 实际推给某个 Envoy 的配置（②有、③无 → 推送/接收环节）
-curl -s 'http://127.0.0.1:15014/debug/config_dump?proxyID=<connectionId>&pretty' | less
+kubectl -n higress-system exec $CP -c discovery -- \
+  curl -s "http://127.0.0.1:15014/debug/config_dump?proxyID=<connectionId>&pretty" | less
 
-# ③ Envoy 侧最终生效配置（在 gateway Pod / standalone 容器内）
-curl -s 'http://127.0.0.1:15000/config_dump' | less
-curl -s 'http://127.0.0.1:15000/clusters'          # cluster 与每 endpoint 的健康/指标
-curl -s 'http://127.0.0.1:15000/stats' | grep -E 'update_(success|rejected)|xds'
-curl -s 'http://127.0.0.1:15020/healthz/ready'     # pilot-agent 就绪探针
+# ③ Envoy 侧最终生效配置（gateway Pod 内）
+kubectl -n higress-system exec $GW -c gateway -- curl -s 'http://127.0.0.1:15000/config_dump' | less
+kubectl -n higress-system exec $GW -c gateway -- curl -s 'http://127.0.0.1:15000/clusters'
+kubectl -n higress-system exec $GW -c gateway -- curl -s 'http://127.0.0.1:15000/stats' | grep -E 'update_(success|rejected)|xds'
+kubectl -n higress-system exec $GW -c gateway -- curl -s 'http://127.0.0.1:15020/healthz/ready'
 ```
 
 其他常用：
 
 ```bash
-# 日志文件（standalone，supervisord 各程序独立落盘）
-/var/log/higress/{controller,pilot,gateway,apiserver,console,supervisord}.log
-
-# K8s 事件与日志
+# K8s 事件与日志（排障第一入口）
 kubectl -n higress-system get events --sort-by=.lastTimestamp | tail -30
-kubectl -n higress-system logs deploy/higress-controller [-c <container>] --tail=200
-kubectl -n higress-system logs <gateway-pod> -c istio-proxy --tail=200
-kubectl -n higress-system describe pod <pod>      # 看探针失败、OOMKilled、拉镜像失败
+kubectl -n higress-system logs deploy/higress-controller -c higress   --tail=200   # 控制面 core
+kubectl -n higress-system logs deploy/higress-controller -c discovery --tail=200   # pilot / xDS
+kubectl -n higress-system logs $GW -c gateway --tail=200                            # gateway/Envoy 侧
+kubectl -n higress-system describe pod $GW        # 探针失败、OOMKilled、拉镜像失败
+kubectl -n higress-system logs $GW --previous     # 上次崩溃前的日志（CrashLoop 必看）
 
 # xDS 计数（Envoy stats）：rejected > 0 即 Envoy 在 NACK 配置
-curl -s http://127.0.0.1:15000/stats | grep -E 'cluster.xds|update_rejected|update_attempt'
+# （接 ③ 的 stats 命令）grep -E 'cluster.xds|update_rejected|update_attempt'
+
+# CRD / 资源合法性
+kubectl -n higress-system get ingress,service,endpoints
+kubectl -n higress-system get wasmplugin,mcpbridge 2>/dev/null
+kubectl get crd | grep higress
 ```
 
 官方文档：[查看运行时配置](https://higress.io/en/docs/latest/ops/how-tos/view-configs/)。
@@ -260,136 +277,156 @@ curl -s http://127.0.0.1:15000/stats | grep -E 'cluster.xds|update_rejected|upda
 ### 2.4 标准排查 SOP（按顺序做，每步记录证据）
 
 1. **现象定性**：`curl -sv` 复现，记录状态码（`000`/404/503/401/5xx）与 Host 头。
-2. **L1 查进程**：standalone `ps aux`+`ss -ltnp`；K8s `get pods`+`describe pod`。
-   - Pod 重启过 → 必看 `logs --previous`。
-3. **若进程缺失/崩溃**：读对应程序日志的**最后一条 error**，定位启动失败原因（资源、证书、FD、配置）。
-   先让进程起来，再谈交互。
-4. **L2 验证连通**：从 gateway 侧 telnet/curl xDS 端口（15010/15012/15051）；查证书与时间。
-5. **L3 看会话**：pilot `/debug/connections` 里有没有 gateway；pilot 日志搜
+2. **L1 查 Pod**：`get pods` + `describe pod`。
+   - Pod 重启过 → 必看 `logs --previous`；ImagePullBackOff → 核对镜像 tag 与 `crictl images`。
+3. **若容器崩溃**：读对应容器日志的**最后一条 error**，定位启动失败原因（资源、证书、FD、配置）。
+   先让 Pod 起来，再谈交互。
+4. **L2 验证连通**：从 gateway Pod 内 curl xDS 端口（`higress-controller:15010/15012`）；查证书与节点时间。
+5. **L3 看会话**：pilot `/debug/connections` 里有没有 gateway；discovery 容器日志搜
    `connect|disconnect|NACK|reject|ADS`。
 6. **三段 configz 比对**：8888 → 15014 → Envoy 15000，找出配置在哪一段消失。
-7. **L4 查资源合法性**：`ingressClassName: higress`、namespace、域名、McpBridge/Nacos 服务源、CRD 是否存在。
-8. **L5 查上游**：`/clusters` 看 endpoint 健康；进 gateway Pod/容器手动 `curl` 上游地址；
-   查路径 Strip、TLS、超时。
+7. **L4 查资源合法性**：`ingressClassName: higress`、namespace（本环境是 `higress-system`）、
+   域名、McpBridge/Nacos 服务源、CRD 是否存在。
+8. **L5 查上游**：`/clusters` 看 endpoint 健康；进 gateway 容器手动 `curl` 上游地址；
+   查路径 Strip、TLS、超时。Pod 访问宿主服务用 `host.minikube.internal`（Task 6 实测解析为 192.168.49.1）。
 9. **看 Envoy NACK 细节**：stats 里 `update_rejected`，pilot 日志里的 error_detail——
    常见为配置用了当前 Envoy 版本不支持的字段。
-10. **等待收敛**：改动后 sleep 10～15 再验证，避免把延迟当故障。
-11. **版本对齐核对**：controller / pilot / Envoy 是否同源版本（混用镜像最容易出 NACK）。
+10. **等待收敛**：改动后 sleep 10～15 再验证，避免把延迟当故障（本机 Task 6 实测 ~12s 生效）。
+11. **版本对齐核对**：controller / pilot / gateway 镜像是否同版本（本环境全部 2.2.4；
+    混用版本最容易出 NACK）。
 12. **记录与固化**：把根因、关键日志、修复写入 plan/ 或提交信息。
 
-### 2.5 实战复盘：本机 2026-09-25 故障（too many open files）
+### 2.5 实战复盘：历史案例（2026-09-25，too many open files）
 
-这是一个标准的 L1 进程层故障，却表现为「controller 活着、gateway 死了」的交互中断，完整证据链如下。
+> 这是本机从旧 all-in-one 环境迁移到 minikube **之前**的真实故障。环境已弃用，
+> 但「Envoy 起不来 → 看似控制面/数据面交互中断」的定位方法完全适用于当前 K8s 环境，
+> 保留作教学案例。K8s 下的等价排查命令附在每步之后。
 
 **现象**
 
 ```bash
-docker ps                      # higress  Up 2 days (unhealthy)
-curl 127.0.0.1:18001 → 200     # Console（java + nginx）正常
-curl 127.0.0.1:18080 → 000     # 网关端口无人监听；健康检查 exit 7（curl couldn't connect）
-docker exec higress ps aux | grep envoy    # 无任何 envoy/pilot-agent 进程
-docker exec higress ss -ltnp   # pilot-discovery 的 15010/15012/15014 都在，唯独没有 80
+docker ps                      # 旧容器 higress  Up (unhealthy)
+curl 127.0.0.1:18001 → 200     # Console（java）正常
+curl 127.0.0.1:18080 → 000     # 网关端口无人监听；健康检查 exit 7
+ps aux | grep envoy            # 容器内无任何 envoy/pilot-agent 进程
+# K8s 等价：kubectl -n higress-system get pods → gateway 反复重启/非 Ready；
+#           curl 18080 → 000；console Pod 正常 —— 同样是「半挂」状态
 ```
 
-**追日志**：`gateway.log` 最后一条——
+**追日志**：gateway 侧日志最后一条——
 
 ```text
 2026-09-25T01:35:17  info  Opening status port 15020
 Error: failed to start default Istio SDS server: failed to start workload secret manager too many open files
 2026-09-25T01:35:17 error  failed to start default Istio SDS server: ... too many open files
+# K8s 等价：kubectl logs <gateway-pod> -c gateway --previous（CrashLoop 时必看上次日志）
 ```
 
-**supervisord 侧**（`/var/log/higress/supervisord.log`）——Envoy 连续启动失败 5 次后被放弃：
+**进程管理器侧**——Envoy 连续启动失败耗尽重试次数后被放弃：
 
 ```text
-01:35:09 INFO exited: gateway (exit status 255; not expected)
-01:35:10 INFO spawned ... 01:35:10 INFO exited (exit status 255)
-01:35:11 INFO spawned ... 01:35:11 INFO exited (exit status 255)
-01:35:13 INFO spawned ... 01:35:13 INFO exited (exit status 255)
-01:35:16 INFO spawned ... 01:35:17 INFO exited (exit status 255)
-01:35:18 INFO gave up: gateway entered FATAL state, too many start retries too quickly
+01:35:09 exited: gateway (exit status 255; not expected)
+01:35:10/11/13/16 spawned → exited (exit status 255) ×4
+01:35:18 gave up: gateway entered FATAL state, too many start retries too quickly
+# K8s 等价：describe pod 里 CrashLoopBackOff + restartCount 持续上涨，现象同构
 ```
 
-**根因**：容器 `nofile` 只有 **1024**（`ulimit -n` 实测）。容器在 01:34 随宿主/daemon 事件重启后，
-Envoy（concurrency=16）启动到 SDS secret manager 阶段申请文件描述符失败（EMFILE），
-pilot-discovery 等其余进程不依赖该限额而正常存活 → 形成「控制面在、数据面没了」的分裂状态。
+**根因**：进程 `nofile` 只有 **1024**。进程重启后，Envoy（concurrency=16）启动到 SDS secret
+manager 阶段申请文件描述符失败（EMFILE），pilot-discovery 等其余进程不依赖该限额而正常存活
+→ 形成「控制面在、数据面没了」的分裂状态。
 
-**修复方向（本指南只记录，不在此执行）**：
-
-```bash
-# 1) 提高文件描述符上限（二选一）
-docker run ... --ulimit nofile=65536:65536 ...          # 启动参数
-# 或 /etc/docker/daemon.json: "default-ulimits": {"nofile": {"Name": "nofile", "Hard": 65536, "Soft": 65536}}
-# 2) 重启容器（或在容器内经正确的 supervisor socket 重新启动 gateway program）
-docker restart higress
-# 3) 验证：ps 见 envoy、ss 见 80、curl 18080 返回 404（空网关正常响应）
-```
+**修复方向**：K8s 下对应调大 Pod/容器 fd 限额，或排查是否有 FD 泄漏把限额耗尽；
+旧容器环境的 `--ulimit nofile=65536` 与 supervisord 细节不再展开。
 
 **方法论收获**：①「交互失败」不一定是网络问题，先确认双方进程都在（L1）；
-② supervisord 管理的程序崩溃重试耗尽会进 **FATAL** 且不再自愈，查状态要看 `supervisord.log`；
-③ 容器内一个组件的资源限额问题可以只杀死数据面，造成极具迷惑性的「半挂」状态。
+② 守护进程重试耗尽后组件**不再自愈**（supervisord FATAL / K8s CrashLoopBackOff），
+必须先消除根因；③ 一个组件的资源限额问题可以只杀死数据面，造成极具迷惑性的
+「控制面活着、数据面死了」状态——这恰恰是「controller/gateway 交互失败」最常见的伪装。
 
 ### 2.6 高频故障模式库
 
 **L1 进程层**
 
-1. **EMFILE `too many open files`**：提高 nofile（见 2.5）。
-2. **OOMKilled**：`describe pod` 见 `OOMKilled`，调大内存 limit 或降 concurrency；standalone 看 dmesg。
-3. **启动即 exit 255**：gateway.log 最后一条 error 即原因（证书/端口占用/FD/bootstraps 生成失败）。
-4. **FATAL 不重启**：supervisord `startretries`（默认 3）耗尽，需人工介入并先消除根因。
+1. **`no route to host`（kubectl 全挂）**：minikube 集群没启动，`minikube start`（非故障，最常见）。
+2. **ImagePullBackOff**：源码镜像没 load 进节点、tag 与 values 不符（core chart 拼接
+   `${hub}/higress/${image}:${tag}`，tag 无 v）→ `minikube image load` + retag（见 1.3 与构建文档 Task 4）。
+3. **OOMKilled**：`describe pod` 看 `last state`；调大内存 limit 或降 gateway concurrency。
+4. **CrashLoopBackOff**：`logs --previous` 看崩溃原因（证书/FD/配置非法）；
+   例如 `too many open files`（见 2.5）。
+5. **探针失败被杀**：`describe pod` 看 Liveness/Readiness 失败事件，先看 `healthz/ready` 端口。
 
 **L2 网络/证书层**
 
-5. **xDS 端口不通**：K8s 中 controller Service/端点错误、gateway 配错 discoveryAddress；
-   standalone 中 pilot 没起来或 loopback 被占。
-6. **mTLS 失败**：`/etc/certs` 缺失/损坏/双方证书不匹配；重跑 initCerts 或重新部署。
-   注意宿主时间异常也会导致证书校验失败。
-7. **NetworkPolicy/防火墙**：K8s 限制 gateway → controller 15010/15012。
+6. **xDS 端口不通**：gateway Pod 内 `curl higress-controller:15012` 验证；
+   Service/EndpointSlice 异常用 `kubectl -n higress-system get endpoints` 核对。
+7. **mTLS 失败**：证书 Secret 异常或宿主时间被重置 → 日志 `certificate verify failed`。
+8. **NetworkPolicy/防火墙**：限制 gateway → controller 15010/15012（minikube 默认无，自建集群才常见）。
 
 **L3 xDS 会话层**
 
-8. **反复断连重连**：pilot 与 envoy 版本不匹配、gRPC keepalive/代理超时截断长连接
-   （中间有四层代理时调大超时）。
-9. **Envoy NACK**：pilot 日志 `Envoy XDS rejects` / `NACK`，error_detail 指明非法字段；
-   多为 Envoy 版本旧、配置引用了不存在的资源（如 RDS 引用了没下发的 cluster）。
-10. **只收到 LDS 没有 RDS/CDS**：ADS 顺序问题或配置在 controller 段缺失，做三段 configz 比对。
+9. **反复断连重连**：pilot 与 envoy 版本不匹配（本环境源码混装时尤其注意 tag 一致）、
+   gRPC keepalive/代理超时截断长连接。
+10. **Envoy NACK**：discovery 日志 `Envoy XDS rejects` / `NACK`，error_detail 指明非法字段；
+    多为 Envoy 版本旧、配置引用了不存在的资源（如 RDS 引用了没下发的 cluster）。
+11. **只收到 LDS 没有 RDS/CDS**：ADS 顺序问题或配置在 controller 段缺失，做三段 configz 比对。
 
 **L4 配置翻译层**
 
-11. **Ingress 无反应**：缺 `ingressClassName: higress`，或 controller 未 watch 该 namespace。
-12. **McpBridge/Nacos 源不通**：standalone/K8s 接 Nacos 时地址、namespace、group 错；
-    Nacos 中服务名与 Ingress backend 对不上。
-13. **CRD 没装/GVK 不识别**：`kubectl get crd` 核对；controller 日志 `no matches for kind`。
-14. **Console 显示成功但实际没存住**：Console→apiserver/controller 链路报错，看 console.log 与 controller.log。
+12. **Ingress 无反应**：缺 `ingressClassName: higress`，或 namespace 不是被 watch 的
+    `higress-system`。
+13. **McpBridge/Nacos 源不通**：地址、namespace、group 错；Nacos 中服务名与 Ingress backend 对不上。
+14. **CRD 没装/GVK 不识别**：`kubectl get crd` 核对；controller 日志 `no matches for kind`。
+15. **Console 显示成功但实际没存住**：Console→controller API 报错，看 console Pod 日志与
+    controller（-c higress）日志。
 
 **L5 上游/流量层**
 
-15. **503 no healthy upstream**：EDS 为空（服务发现没实例）或全部健康检查失败；
-    `/clusters` 里看 endpoint 健康标记。
-16. **404 但配置存在**：域名（Host 头）不匹配、路径前缀未 Strip、pathType 语义差异。
-17. **上游 TLS 失败**：cluster 的 transport socket 未配 tls / SNI 不对。
-18. **AI SSE 卡死**：插件或上游缓冲流式响应；确认插件不缓冲 body、超时按长连接设置。
+16. **503 no healthy upstream**：EDS 为空或全部健康检查失败；`/clusters` 里看 endpoint 健康标记。
+17. **404 但配置存在**：域名（Host 头）不匹配、路径前缀未 Strip、pathType 语义差异。
+    本机实测：Task 6 的路由需要 `-H 'Host: demo.local'`。
+18. **上游 TLS 失败**：cluster 的 transport socket 未配 tls / SNI 不对。
+19. **AI SSE 卡死**：插件或上游缓冲流式响应；确认插件不缓冲 body、超时按长连接设置。
 
-**standalone 专属（本机历史踩坑）**
+**minikube 环境专属（本机历史踩坑）**
 
-19. `docker cp` 是 merge 语义：不会删目标多余文件，旧路由会「复活」；收敛要显式 `rm`。
-20. 容器访问宿主服务用网桥 IP（`172.17.0.1` 等），不是 `127.0.0.1`；
-    K8s Pod 访问宿主用 `host.minikube.internal`。
-21. xDS 生效有 10～15s 延迟，脚本必须轮询。
+20. **Pod → 宿主服务**：用 `host.minikube.internal`（解析为 192.168.49.1），不是 127.0.0.1。
+    写 Service(type: ClusterIP) + Endpoints 指向它，样例见 `infra/minikube/task6-downstream.yaml`。
+21. **xDS 生效延迟 10～15s**：脚本必须轮询；Task 6 实测增/删收敛各约 12s。
+22. **minikube stop 后路由自动恢复**：`minikube start` 回来即可，不需要重建资源；
+    但 `minikube delete` 会全部丢失（ Helm 两个 chart + Ingress 均需重装）。
+23. **docker 客户端代理污染**：本机 `~/.docker/config.json` 的 proxies 会注入所有容器，
+    `noProxy` 必须含 `192.168.49.0/24`，否则 kubelet 注册/拉镜像失败。
 
-### 2.7 standalone ↔ K8s 常用命令对照
+### 2.7 常用命令速查
 
-| 目的 | standalone | K8s（minikube） |
-|---|---|---|
-| 看组件状态 | `docker exec higress ps aux` | `kubectl -n higress-system get pods` |
-| 看端口 | `docker exec higress ss -ltnp` | `kubectl -n higress-system get svc` |
-| controller 日志 | `/var/log/higress/controller.log` | `kubectl -n higress-system logs deploy/higress-controller` |
-| xDS server 日志 | `/var/log/higress/pilot.log` | 同上（controller Pod 内 pilot 容器） |
-| gateway 日志 | `/var/log/higress/gateway.log` | `kubectl logs <gateway-pod> -c istio-proxy` |
-| 重启组件 | 容器内 supervisorctl（注意实际 sock 路径） | `kubectl rollout restart deploy ...` / 删 Pod |
-| 下发路由 | 写 `/data/{ingresses,services,endpoints}/*.yaml` | `kubectl apply -f route.yaml` |
-| 列路由 | `docker exec higress ls /data/ingresses` | `kubectl get ingress` |
-| 进环境 | `docker exec -it higress sh` | `kubectl -n higress-system exec -it <pod> -- sh` |
+```bash
+# 状态
+minikube status && kubectl -n higress-system get pods -o wide
+kubectl -n higress-system get svc,ingress
+helm list -n higress-system                     # core + console 两个 release
+
+# 日志（按容器区分）
+kubectl -n higress-system logs deploy/higress-controller -c higress   # controller core
+kubectl -n higress-system logs deploy/higress-controller -c discovery # pilot（xDS server）
+kubectl -n higress-system logs <gateway-pod> -c gateway               # Envoy 侧
+
+# 下发/删除路由（标准 Ingress，本机样例 infra/minikube/task6-downstream.yaml）
+kubectl apply -f infra/minikube/task6-downstream.yaml && sleep 12
+kubectl -n higress-system delete ingress demo-time && sleep 10
+
+# 进环境
+kubectl -n higress-system exec -it $GW -c gateway -- sh         # gateway/Envoy
+kubectl -n higress-system exec -it $CP -c discovery -- sh       # pilot
+
+# 重启组件（改了 values/镜像后）
+helm upgrade higress ~/IdeaProjects/agentspace/higress/helm/core -n higress-system -f infra/minikube/higress-values.yaml
+kubectl -n higress-system rollout restart deploy/higress-controller
+kubectl -n higress-system delete pod $GW                        # gateway 无 Deployment 锁时直接删 Pod 重建
+
+# 镜像（源码迭代后更新数据面）
+minikube image load registry.local/higress/gateway:2.2.4
+minikube ssh -- sudo crictl images | grep higress
+```
 
 ---
 
@@ -401,24 +438,25 @@ docker restart higress
 
 - **读**：[Higress 是什么](https://higress.cn/docs/latest/overview/what-is-higress/)、[FAQ](https://higress.cn/docs/latest/overview/faq/)、本文 Part 1。
 - **做**：
-  1. 确认网关：`curl 127.0.0.1:18080`；打开 Console 18001。
-  2. Console 手工建一条到 echo 上游的路由，curl 200，删除后 404。
-  3. 观察 `gateway.log` 启动段与 `pilot.log` 的 push 日志，把日志和架构图对应起来。
-- **产出**：一张手绘控制面/数据面/xDS 关系图。
+  1. `minikube start`；确认 `kubectl -n higress-system get pods` 全 Running；打开 `http://127.0.0.1:18080/`（Console）。
+  2. `kubectl apply` 一条到 echo 上游的 Ingress+Service+Endpoints，curl 200，删除后 404（Task 6 流程复走）。
+  3. 看 discovery 容器日志的 push 记录与 `gateway` 容器日志，把日志和架构图对应起来。
+- **产出**：一张手绘 controller→pilot→envoy 配置链路图。
 - **验收**：能回答「控制面和数据面分别是什么」「xDS 解决什么问题」「为什么配置改了不用重启 Envoy」。
 
 ### 第 2 周：路由与流量治理基础
 
 - **学**：路径匹配（pathType）、重写/重定向、超时、重试、CORS、Header 改写；Ingress 注解。
 - **分清对象**：`Ingress`（标准）、`IngressRoute`（Higress/Istio 扩展）、`McpBridge`（服务来源）。
-- **做**：用「路径路由 + Strip 前缀 + 超时重试」暴露一个 HTTP 服务；故意制造 404 并用 2.4 SOP 定位。
+- **做**：用「路径路由 + Strip 前缀 + 超时重试」暴露宿主上的服务（`host.minikube.internal`）；
+  故意制造 404 并用 2.4 SOP 定位。
 - **验收**：不看文档把任意 HTTP 服务经 Higress 暴露并 200；说清 404 的三种可能来源。
 
 ### 第 3 周：服务发现与上游治理
 
-- **学**：静态 DNS 上游 vs Nacos（McpBridge）vs K8s Service；LB、健康检查、连接池、熔断（outlierDetection）。
+- **学**：K8s Service vs 静态 DNS 上游 vs Nacos（McpBridge）；LB、健康检查、连接池、熔断（outlierDetection）。
 - **做**：注册两个实例验证轮询；下线一个验证自动摘除（观察 EDS 与 503 变化）。
-- **工具**：熟练使用 Envoy admin `/clusters`、`/stats`、pilot `/debug/connections`。
+- **工具**：熟练使用 Envoy admin `/clusters`、`/stats`、pilot `/debug/connections`（见 2.3）。
 - **验收**：解释 503 `no healthy upstream` 时该按什么顺序查。
 
 ### 第 4 周：Wasm 插件体系
@@ -426,7 +464,7 @@ docker restart higress
 - **学**：[插件使用引导](https://higress.cn/docs/latest/plugins/intro/)；Go SDK 的
   `parse`/`requestHeaders`/`requestBody`/`responseHeaders` 阶段。
 - **做**：
-  1. 路由上绑 `cors` 和 `key-auth`，用 `curl -i` 对比。
+  1. 路由上绑 `cors` 和 `key-auth`（WasmPlugin CR 或 Console），用 `curl -i` 对比。
   2. 跟做 [30 行写 Wasm Go 插件](https://higress.cn/blog/30-line-wasm/)：实现「带特定 Header 才放行 + 注入请求 ID」，热加载。
 - **验收**：讲清插件在请求链路上的执行顺序、为什么认证插件放最前。
 
@@ -446,11 +484,11 @@ docker restart higress
 ### 第 6 周：可观测、生产化、读源码
 
 - **学**：access log、Prometheus（Envoy `/stats/prometheus`）、Grafana、Tracing；
-  TLS、HPA、金丝雀发布。
-- **读源码**（[源码阅读指引](https://higress.cn/docs/latest/dev/code/)）：
+  TLS、HPA、金丝雀发布。（本环境 o11y 关闭，可按官方文档补开）
+- **读源码**（本环境四镜像皆源码构建，读码条件最好；[源码阅读指引](https://higress.cn/docs/latest/dev/code/)）：
   controller 中 Ingress→内部配置（`pkg/ingress/`）、WasmPlugin 转换、xDS server 入口。
   建议顺序：`pkg/ingress/config/ingress_config.go` → controller 启动 main → MCP server →
-  对照 Istio `pilot-discovery` 的 xDS push。
+  对照 `external/istio` 里 pilot-discovery 的 xDS push。
 - **做**：给路由配 v1/v2 灰度 90/10 + 指标看板（QPS/延迟/4xx/Token）。
 - **验收**：从 metrics 找到任意一条路由的 QPS、错误率与 Token 消耗；能在源码里指出一条路由的转换位置。
 
@@ -460,8 +498,9 @@ docker restart higress
 → 4. 金丝雀 90/10 切 50/50 → 5. AI 统一入口 + fallback → 6. Prometheus + Grafana 闭环
 → 7. 自研 Wasm 插件。
 
-> 本机可直接参考：`higress-ai-demo`（AI 全链路）、`scg-to-higress-migration`（治理规则迁移）、
-> `scg-wso2-management`（最短：一条路由如何经 standalone 通道生效，建议先读）。
+> 本机可直接参考：`higress-ai-demo`（AI 全链路 + 本 minikube 环境）、
+> `scg-to-higress-migration`（治理规则迁移）、
+> `scg-wso2-management`（最短：一条路由如何经标准 Ingress 生效，建议先读）。
 
 ---
 
@@ -471,7 +510,7 @@ docker restart higress
 
 - 官网/文档（中文）：https://higress.cn/ ；新版文档站：https://higress.ai/
 - [Higress 是什么](https://higress.cn/docs/latest/overview/what-is-higress/) ｜ [FAQ](https://higress.cn/docs/latest/overview/faq/)
-- [Helm 云原生部署](https://higress.cn/docs/latest/ops/deploy-by-helm/) ｜ [Docker Compose 独立部署](https://higress.cn/docs/latest/ops/deploy-by-docker-compose/)
+- [Helm 云原生部署](https://higress.cn/docs/latest/ops/deploy-by-helm/)
 - [查看运行时配置（三段 debug）](https://higress.io/en/docs/latest/ops/how-tos/view-configs/)
 - [插件使用引导](https://higress.cn/docs/latest/plugins/intro/) ｜ [Wasm 生效原理](https://higress.io/docs/latest/plugins/wasm-dev/wasm19/)
 - AI 网关：[Quick Start](https://higress.ai/docs/ai/quick-start/) ｜
@@ -481,13 +520,12 @@ docker restart higress
   [语义缓存](https://higress.ai/en/docs/ai/scene-guide/semantic-cache)
 - [源码阅读指引](https://higress.cn/docs/latest/dev/code/) ｜ [组件编译/架构说明](https://higress.cn/docs/latest/dev/architecture/)
 - GitHub：https://github.com/alibaba/higress （samples、issues 是最好的故障案例库）
-- 一键体验脚本：`curl -sS https://higress.cn/ai-gateway/install.sh | bash`
 
 ### 底层依赖（当字典查，不必通读）
 
 - Envoy 官方文档：https://www.envoyproxy.io/docs/envoy/latest/（Architecture / Dynamic configuration(xDS) /
   HTTP connection manager / Admin）
-- Envoy xDS REST 与 gRPC 协议：https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol
+- Envoy xDS 协议：https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol
 - Istio 文档：https://istio.io/latest/docs/（Pilot、流量管理 CRD）
 - Nacos：https://nacos.io/zh-cn/docs/what-is-nacos.html （服务发现/配置中心）
 - K8s Ingress：https://kubernetes.io/docs/concepts/services-networking/ingress/ ；
@@ -506,7 +544,7 @@ docker restart higress
 - 本地读书笔记：`bookspace/book_notes/notes_docs/blogs/ainotes/higress-gateway/higress-gateway.md`
 
 **读法建议**：官方「Quick Start → 用户指南（路由/服务来源）→ 插件 → AI 网关」为主线通读；
-Envoy/Istio 文档在排障中按术语反查；学习中每个概念都立刻在本机网关验证，比只看快得多。
+Envoy/Istio 文档在排障中按术语反查；学习中每个概念都立刻在本机 minikube 集群验证，比只看快得多。
 
 ---
 
@@ -524,7 +562,7 @@ Envoy/Istio 文档在排障中按术语反查；学习中每个概念都立刻�
 - [ ] 验证 SSE 流式应答不被插件/网关缓冲
 - [ ] 能看懂 Go Wasm 插件的请求/响应钩子并做小修改
 - [ ] 从 Higress metrics 找到指定路由的 QPS、错误率、Token 消耗
-- [ ] 能复述本机 0925「too many open files」故障的分层定位过程
+- [ ] 能复述 0925「too many open files」案例的分层定位过程，并说出 K8s 下的等价命令
 
 勾到 8 个以上即跨过「会用」门槛，之后选一个方向深入：AI 网关 / 服务治理 / Wasm 插件开发。
 
@@ -534,10 +572,10 @@ Envoy/Istio 文档在排障中按术语反查；学习中每个概念都立刻�
 
 | 术语 | 含义 |
 |---|---|
-| Control Plane | 控制面：管理/下发配置，不转发业务流量（controller + pilot） |
-| Data Plane | 数据面：实际转发请求（Envoy） |
+| Control Plane | 控制面：管理/下发配置，不转发业务流量（controller core + pilot） |
+| Data Plane | 数据面：实际转发请求（Envoy，即 higress-gateway Pod） |
 | Envoy | C++ 高性能代理，Higress 的数据面内核 |
-| pilot-discovery | Istio 的 xDS server，Higress 保留并复用 |
+| pilot-discovery | Istio 的 xDS server，Higress 保留并复用（controller Pod 的 `discovery` 容器） |
 | pilot-agent | Envoy 守护进程：生成 bootstrap、拉起/监控 Envoy、提供 status 端口 |
 | xDS | LDS/RDS/CDS/EDS 等发现协议的统称，gRPC 流式 |
 | ADS | 聚合发现服务，多种 xDS 复用一条有序 gRPC 流 |
@@ -547,11 +585,13 @@ Envoy/Istio 文档在排障中按术语反查；学习中每个概念都立刻�
 | HCM | HTTP Connection Manager，Envoy 的 HTTP 过滤链核心 |
 | McpBridge | Higress CRD：把 Nacos 等外部服务来源桥接进网关 |
 | WasmPlugin | Higress/Istio 插件 CR，声明 Wasm 插件与配置 |
-| SDS | Secret Discovery Service，证书/密钥下发（Envoy 0925 故障即崩在此处） |
+| SDS | Secret Discovery Service，证书/密钥下发（0925 案例即崩在此处） |
 | mTLS | 双向 TLS，xDS 控制面与数据面之间的认证方式 |
-| all-in-one | standalone 单容器部署形态（supervisord 管理全部进程） |
+| NodePort | K8s Service 类型；本环境 30080/30443/30001 经 minikube 映射到宿主 18080/18443/18001 |
+| host.minikube.internal | minikube 注入的 DNS 名，Pod 借此访问宿主机服务（→192.168.49.1） |
+| minikube image load | 把宿主 docker 镜像灌进 minikube 节点的 containerd（源码镜像上线必经步骤） |
 
 ---
 
-*本文为 AI 辅助整理的学习与排障框架，架构细节结合本机实际部署与官方文档；
+*本文为 AI 辅助整理的学习与排障框架，架构细节结合本机 minikube 源码部署实测与官方文档；
 版本特性、端口与参数请以 Higress 官方最新文档为准。*
