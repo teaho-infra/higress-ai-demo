@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codex-xds-echo
+  namespace: higress-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: codex-xds-echo
+  template:
+    metadata:
+      labels:
+        app: codex-xds-echo
+    spec:
+      containers:
+        - name: echo
+          image: hashicorp/http-echo:1.0.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - -listen=:5678
+            - -text=codex-xds-ok
+          ports:
+            - containerPort: 5678
+              name: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codex-xds-echo
+  namespace: higress-system
+spec:
+  selector:
+    app: codex-xds-echo
+  ports:
+    - name: http
+      port: 5678
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: codex-xds-demo
+  namespace: higress-system
+spec:
+  ingressClassName: higress
+  rules:
+    - host: demo.local
+      http:
+        paths:
+          - path: /demo
+            pathType: Prefix
+            backend:
+              service:
+                name: codex-xds-echo
+                port:
+                  number: 5678

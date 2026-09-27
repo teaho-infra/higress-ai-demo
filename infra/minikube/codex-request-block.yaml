@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codex-wasm-host
+  namespace: higress-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: codex-wasm-host
+  template:
+    metadata:
+      labels:
+        app: codex-wasm-host
+    spec:
+      containers:
+        - name: nginx
+          image: registry.local/higress/codex-request-block:2.2.4
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+              name: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codex-wasm-host
+  namespace: higress-system
+spec:
+  selector:
+    app: codex-wasm-host
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: codex-request-block
+  namespace: higress-system
+spec:
+  defaultConfig:
+    block_urls:
+      - /demo/blocked
+    blocked_code: 403
+    blocked_message: codex-wasm-blocked
+  phase: AUTHN
+  priority: 310
+  url: http://codex-wasm-host.higress-system.svc.cluster.local/main.wasm

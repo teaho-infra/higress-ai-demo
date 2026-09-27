@@ -1,0 +1,9 @@
+FROM eclipse-temurin:21-jdk
+
+WORKDIR /app
+COPY console/target/higress-console.jar /app/higress-console.jar
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
+
+EXPOSE 8080
+CMD ["/app/start.sh"]
