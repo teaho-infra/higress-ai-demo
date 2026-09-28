@@ -7,7 +7,7 @@
 - 固定 Higress 和 Higress Console 源码版本 v2.2.4，构建 controller、pilot、gateway、console 镜像。Gateway 使用源码组装的数据面镜像；若 Envoy 二进制取官方预编译产物，会明确记录。
 - 用 Docker driver 启动独立的 Minikube 单节点集群，Helm 部署 `higress-system` 中的 core 和 console。
 - 用真实 Ingress 证明 controller → pilot → gateway 的 xDS 配置下发，以 Envoy `config_dump` 和 HTTP 响应双重验证。
-- 安装一个 Wasm 插件，证明插件配置已下发，并以实际响应证明插件执行。
+- 从 Higress 源码编译 `request-block`、`key-auth`、`ai-proxy` Wasm 插件，打包并推送 OCI 镜像到 Minikube 内的 Registry，通过 `oci://` 部署，证明插件配置下发与实际执行；使用本地 OpenAI 兼容模拟服务验证 AI 请求，不需要真实模型 API Key。
 
 ## 本机约束
 
@@ -22,10 +22,10 @@
 | 阶段 | 状态 | 证据 |
 | --- | --- | --- |
 | 工具与源码 | 完成 | Higress `58666ac`，Console `f841043`，Go 1.26.0，Helm 3.16.4 |
-| 镜像构建 | 完成 | Controller `107c54a9`、pilot `88abc55a`、gateway `2ceb4611`、Console `201e8e1b`；另有本地 Wasm 文件服务镜像 |
-| Minikube 与 Helm 部署 | 完成 | `higress-dev` 节点 Ready；两套 Helm release 为 `deployed`；五个 Deployment 全部 Ready |
+| 镜像构建 | 完成 | Controller `107c54a9`、pilot `88abc55a`、gateway `2ceb4611`、Console `201e8e1b`；源码 Wasm OCI 镜像 request-block `4a425fd2`、key-auth `ac92cec0`、ai-proxy `3534ffbd` |
+| Minikube 与 Helm 部署 | 完成 | `higress-dev` 节点 Ready；两套 Helm release 为 `deployed`；Controller、Gateway、Console、回显后端、OCI Registry 均 Ready，旧 HTTP Wasm 服务缩为 0 |
 | xDS 与 gateway 验证 | 完成 | controller、pilot、Envoy 三段可见路由；ADS 客户端 1 个；路由更新后新域名 200、旧域名 404，恢复亦成功 |
-| Wasm 插件验证 | 完成 | Gateway 取得 6,630,522 字节 Wasm；允许路径 200、屏蔽路径 403，日志 `via_wasm`；ECDS 更新成功、拒绝 0 |
+| Wasm 插件验证 | 完成 | 三个 `oci://` 镜像从集群 Registry 拉取；request-block 允许路径 200、屏蔽路径 403；key-auth 无 Key 401、错误 Key 403、正确 Key 200；ai-proxy 把 `demo-model` 映射为 `mock-model`，上游收到 `Bearer mock-upstream-token`，模拟响应 200；ECDS 拒绝 0 |
 
 ## 成功命令逐条记录
 
@@ -393,6 +393,8 @@
 
 ### 5. Wasm 插件
 
+本节是首次使用集群内 HTTP 文件服务验证 Wasm 代码能执行的过程；**最终部署方式已改为下一章的 OCI 插件镜像**。
+
 1. Gateway Pod 从集群内的 Wasm 文件服务拿到 `200` 和 `6630522` 字节；Envoy ECDS 中该插件的 `update_success: 2`，`config_fail: 0`、`update_rejected: 0`：
 
    ```bash
@@ -412,6 +414,256 @@
    kubectl --context higress-dev -n higress-system logs deployment/higress-gateway -c higress-gateway --tail=150 | \
      rg 'request-block.url_blocked.keyword'
    ```
+
+## Wasm 源码打包为 OCI 镜像并部署（request-block）
+
+前面的 HTTP 文件服务只用于先验证 `.wasm` 能执行。本节继续把同一个 Higress v2.2.4 源码插件封装为标准 OCI 镜像，推入 Minikube 集群内的 Registry，并让 Gateway 通过 `oci://` 拉取。以下命令均已在本机执行成功；终端 A 的 `port-forward` 在推送完成后已按 `Ctrl+C` 停止。
+
+1. **重新从源码编译并打包插件。**Higress 源码 commit 为 `58666ac985cee19a0a9a353421c63cead6d0cb47`。在 `/home/teaho/IdeaProjects/agentspace/higress/plugins/wasm-go/examples/request-block` 执行：
+
+   ```bash
+   git rev-parse HEAD
+   env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+     PATH=/home/teaho/tools/go1.26.0/bin:$PATH \
+     GOPROXY='https://goproxy.cn|https://proxy.golang.org' \
+     GOMODCACHE=/home/teaho/.cache/higress-go-mod GOMAXPROCS=2 \
+     GOOS=wasip1 GOARCH=wasm \
+     go build -buildmode=c-shared -o main.wasm .
+   sha256sum main.wasm
+   file main.wasm
+   docker build --platform linux/amd64 -t localhost:15005/request-block:2.2.4 -f Dockerfile .
+   docker image inspect localhost:15005/request-block:2.2.4 --format '{{.Id}} {{.Size}}'
+   ```
+
+   `main.wasm` 是 WebAssembly MVP 模块，SHA-256 为 `7a1ff2e43b06c3d8e7b57e241abd88282b7553b736e9b57c3a985b8b62112eb0`。直接使用**源码自带**的 `examples/request-block/Dockerfile`（`FROM scratch`，将 `main.wasm` 复制为 `/plugin.wasm`），得到镜像 `sha256:4a425fd2c26475c816997850768575e1d52e5bdc0744876f5ac4bc6733ffa087`，大小 `6630522` 字节。它不是前文用于 HTTP 文件服务的 nginx 镜像。
+
+2. **在 Minikube 内部署持久化 OCI Registry。**清单为 [codex-wasm-registry.yaml](../infra/minikube/codex-wasm-registry.yaml)，包含 `registry:2.8.3`、ClusterIP Service 和 1 GiB PVC。在仓库 `/home/teaho/IdeaProjects/teaho-infra/higress-ai-demo` 执行：
+
+   ```bash
+   docker pull --platform linux/amd64 registry:2.8.3
+   minikube -p higress-dev image load registry:2.8.3
+   kubectl --context higress-dev apply -f infra/minikube/codex-wasm-registry.yaml
+   kubectl --context higress-dev -n higress-system rollout status deployment/codex-wasm-registry --timeout=120s
+   kubectl --context higress-dev -n higress-system get pvc codex-wasm-registry-data
+   ```
+
+   Registry Pod 为 `1/1 Running`，PVC 为 `Bound`。Service 只在集群内暴露 `:5000`。
+
+3. **通过临时端口转发从宿主机推送 OCI 镜像。**终端 A 运行下列命令，保持它运行至 `docker push` 完成：
+
+   ```bash
+   kubectl --context higress-dev -n higress-system port-forward \
+     service/codex-wasm-registry 15005:5000 --address 127.0.0.1
+   ```
+
+   终端 B 在插件源码目录运行：
+
+   ```bash
+   curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:15005/v2/
+   docker push localhost:15005/request-block:2.2.4
+   curl -fsS -o /dev/null -w 'manifest=%{http_code} bytes=%{size_download}\n' \
+     -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+     http://127.0.0.1:15005/v2/request-block/manifests/2.2.4
+   ```
+
+   `/v2/` 返回 `200`，推送摘要为 `sha256:b20aee4b2cd965ebf7710d299adf851440332909a1892d0582dd0b5a408b4deb`，Manifest 返回 `200`、`527` 字节。`localhost:15005` 只是宿主机推送入口；Gateway 拉取同一 Registry 的集群 Service 地址。在仓库目录从 Gateway 容器测试 Service 也返回 `200`：
+
+   ```bash
+   kubectl --context higress-dev -n higress-system exec deployment/higress-gateway -c higress-gateway -- \
+     curl -fsS -o /dev/null -w 'registry=%{http_code}\n' \
+       http://codex-wasm-registry.higress-system.svc.cluster.local:5000/v2/
+   ```
+
+4. **让 Gateway 只允许该本地 HTTP Registry。**[higress-values.yaml](../infra/minikube/higress-values.yaml) 的 `gateway.env.WASM_INSECURE_REGISTRIES` 已设为 `codex-wasm-registry.higress-system.svc.cluster.local:5000`。在仓库目录执行，Core Helm release 升到 revision 2，Gateway 完成滚动更新：
+
+   ```bash
+   /home/teaho/.local/bin/helm lint /home/teaho/IdeaProjects/agentspace/higress/helm/core \
+     -f infra/minikube/higress-values.yaml
+   /home/teaho/.local/bin/helm upgrade higress /home/teaho/IdeaProjects/agentspace/higress/helm/core \
+     --kube-context higress-dev -n higress-system \
+     -f infra/minikube/higress-values.yaml --wait --timeout=3m
+   kubectl --context higress-dev -n higress-system get deployment higress-gateway \
+     -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="WASM_INSECURE_REGISTRIES")].value}{"\n"}'
+   ```
+
+5. **将插件 CR 切到 OCI 镜像。**[codex-request-block-oci.yaml](../infra/minikube/codex-request-block-oci.yaml) 保留原屏蔽规则，将 `spec.url` 改为 `oci://codex-wasm-registry.higress-system.svc.cluster.local:5000/request-block:2.2.4`。在仓库目录执行：
+
+   ```bash
+   kubectl --context higress-dev apply -f infra/minikube/codex-request-block-oci.yaml
+   kubectl --context higress-dev -n higress-system get wasmplugin codex-request-block \
+     -o jsonpath='{.spec.url}{"\n"}'
+   kubectl --context higress-dev -n higress-system exec deployment/higress-controller -c discovery -- \
+     curl -fsS 'http://127.0.0.1:15014/debug/configz?pretty' | rg -m 3 'oci://codex-wasm-registry'
+   kubectl --context higress-dev -n higress-system logs deployment/higress-gateway -c higress-gateway --since=2m | \
+     rg 'fetching image request-block'
+   kubectl --context higress-dev -n higress-system logs deployment/codex-wasm-registry -c registry --since=3m | \
+     rg 'GET /v2/request-block/(manifests|blobs)' | tail -n 10
+   ```
+
+   pilot 配置快照中出现 OCI URL；Gateway 日志写明从 `codex-wasm-registry...:5000` 拉取 tag `2.2.4`；Registry 日志显示 Gateway Pod 对 Manifest 与 Blob 的请求均为 `200`。Envoy ECDS 中 `codex-request-block.update_success: 3`、`config_fail: 0`、`update_rejected: 0`：
+
+   ```bash
+   kubectl --context higress-dev -n higress-system exec deployment/higress-gateway -c higress-gateway -- \
+     curl -fsS 'http://127.0.0.1:15000/stats' | \
+     rg 'extension_config_discovery.http_filter.extensions.istio.io/wasmplugin/higress-system.codex-request-block.(update_success|update_rejected|config_fail):'
+   ```
+
+6. **停用旧 HTTP 文件服务，重启 Gateway 做冷启动验证。**在仓库目录执行：
+
+   ```bash
+   kubectl --context higress-dev -n higress-system scale deployment/codex-wasm-host --replicas=0
+   kubectl --context higress-dev -n higress-system rollout status deployment/codex-wasm-host --timeout=60s
+   kubectl --context higress-dev -n higress-system rollout restart deployment/higress-gateway
+   kubectl --context higress-dev -n higress-system rollout status deployment/higress-gateway --timeout=180s
+   curl -sS -o /dev/null -w 'allowed=%{http_code}\n' \
+     -H 'Host: demo.local' http://127.0.0.1:18080/demo/ok
+   curl -sS -o /dev/null -w 'blocked=%{http_code}\n' \
+     -H 'Host: demo.local' http://127.0.0.1:18080/demo/blocked
+   kubectl --context higress-dev -n higress-system logs deployment/higress-gateway -c higress-gateway --since=90s | \
+     rg 'fetching image request-block|request-block.url_blocked.keyword'
+   ```
+
+   旧 HTTP 服务为 `0/0`，新 Gateway 为 `1/1`。重启后的 Gateway 再次记录 OCI 镜像拉取；普通请求为 `200`，屏蔽请求为 `403`，Console 为 `200`，ECDS 再次显示 `update_success: 2`、`config_fail: 0`、`update_rejected: 0`；access log 的 `response_code_details` 仍为 `via_wasm::higress-system.codex-request-block::request-block.url_blocked.keyword`。端口转发停止后这些状态码仍保持，因此最终运行不依赖旧 HTTP 文件服务，也不依赖宿主机的临时推送端口。
+
+## 源码打包并验证 key-auth 与 ai-proxy
+
+继续使用上一章已部署的 `higress-dev`、OCI Registry 和 `WASM_INSECURE_REGISTRIES`。两个插件都来自同一个 Higress v2.2.4 源码树，镜像中的 `/plugin.wasm` 均由本机编译。示例使用 [codex-ai-key-demo.yaml](../infra/minikube/codex-ai-key-demo.yaml) 中的本地模拟 OpenAI 上游；`codex-local-example-key` 和 `mock-upstream-token` 只是演示值，不是线上凭证，也不调用真实模型。以下命令和 HTTP 结果均已在本机验证。
+
+1. **从源码编译两个 Wasm 模块。**分别在对应源码目录执行相同的构建命令：
+
+   ```bash
+   cd /home/teaho/IdeaProjects/agentspace/higress/plugins/wasm-go/examples/key-auth
+   env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+     PATH=/home/teaho/tools/go1.26.0/bin:$PATH \
+     GOPROXY='https://goproxy.cn|https://proxy.golang.org' \
+     GOMODCACHE=/home/teaho/.cache/higress-go-mod GOMAXPROCS=2 \
+     GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o main.wasm .
+   file main.wasm
+   sha256sum main.wasm
+
+   cd /home/teaho/IdeaProjects/agentspace/higress/plugins/wasm-go/extensions/ai-proxy
+   env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+     PATH=/home/teaho/tools/go1.26.0/bin:$PATH \
+     GOPROXY='https://goproxy.cn|https://proxy.golang.org' \
+     GOMODCACHE=/home/teaho/.cache/higress-go-mod GOMAXPROCS=2 \
+     GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o main.wasm .
+   file main.wasm
+   sha256sum main.wasm
+   ```
+
+   两者均识别为 WebAssembly 模块。`key-auth` 的 Wasm SHA-256 为 `df9602dc42e00423a49abd94a146c453906dd81c1cd6ab2e03d69b3e29eb10b8`，`ai-proxy` 为 `424709692ab1edee33ea188ef0b27e40ea096a4c22e29520e3aeaab09e88e8be`。
+
+2. **打包为 OCI 镜像并推送集群 Registry。**[Dockerfile.wasm-oci-codex](../infra/minikube/Dockerfile.wasm-oci-codex) 只有 `FROM scratch` 和 `COPY main.wasm /plugin.wasm`。先在终端 A 保持端口转发（若上一章的会话已经停止，则重新运行）：
+
+   ```bash
+   kubectl --context higress-dev -n higress-system port-forward \
+     service/codex-wasm-registry 15005:5000 --address 127.0.0.1
+   ```
+
+   终端 B 运行：
+
+   ```bash
+   docker build --platform linux/amd64 \
+     -t localhost:15005/key-auth:2.2.4 \
+     -f /home/teaho/IdeaProjects/teaho-infra/higress-ai-demo/infra/minikube/Dockerfile.wasm-oci-codex \
+     /home/teaho/IdeaProjects/agentspace/higress/plugins/wasm-go/examples/key-auth
+   docker build --platform linux/amd64 \
+     -t localhost:15005/ai-proxy:2.2.4 \
+     -f /home/teaho/IdeaProjects/teaho-infra/higress-ai-demo/infra/minikube/Dockerfile.wasm-oci-codex \
+     /home/teaho/IdeaProjects/agentspace/higress/plugins/wasm-go/extensions/ai-proxy
+   docker image inspect localhost:15005/key-auth:2.2.4 --format '{{.Id}} {{.Size}}'
+   docker image inspect localhost:15005/ai-proxy:2.2.4 --format '{{.Id}} {{.Size}}'
+   docker push localhost:15005/key-auth:2.2.4
+   docker push localhost:15005/ai-proxy:2.2.4
+   curl -fsS -o /dev/null -w 'key-auth manifest=%{http_code}\n' \
+     -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+     http://127.0.0.1:15005/v2/key-auth/manifests/2.2.4
+   curl -fsS -o /dev/null -w 'ai-proxy manifest=%{http_code}\n' \
+     -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+     http://127.0.0.1:15005/v2/ai-proxy/manifests/2.2.4
+   ```
+
+   本机镜像 ID 分别为 `sha256:ac92cec0...`、`sha256:3534ffbd...`；推送后 Registry 摘要分别为 `sha256:632f1f2894f03f25e49623290bc9e31fd11829508eafe9cf12f2ea5a84ef5051`、`sha256:e27df3903d0ced50e391542d77eb5a4e9c7d3976354793107b5ccd520801464b`。两个 Manifest 查询均为 `200`。推送完成后可在终端 A 用 `Ctrl+C` 关闭端口转发；Gateway 始终通过集群 Service 拉取镜像。
+
+3. **部署本地上游、路由和插件。**模拟服务只接受 `/v1/chat/completions`，回显收到的模型名、Host、Authorization 和鉴权消费者；支持 `Content-Length` 与 chunked 请求体。为离线启动先载入 `python:3.12-alpine`。在 `/home/teaho/IdeaProjects/teaho-infra/higress-ai-demo` 执行：
+
+   ```bash
+   cd /home/teaho/IdeaProjects/teaho-infra/higress-ai-demo
+   docker pull --platform linux/amd64 python:3.12-alpine
+   minikube -p higress-dev image load python:3.12-alpine
+   kubectl --context higress-dev apply --dry-run=server -f infra/minikube/codex-ai-key-demo.yaml
+   kubectl --context higress-dev apply -f infra/minikube/codex-ai-key-demo.yaml
+   kubectl --context higress-dev -n higress-system rollout status deployment/codex-ai-mock --timeout=90s
+   kubectl --context higress-dev -n higress-system get ingress codex-key-auth-demo codex-ai-proxy-demo
+   kubectl --context higress-dev -n higress-system get wasmplugin codex-key-auth codex-ai-proxy
+   ```
+
+   清单定义 `auth.local/auth` 到回显后端、`ai.local/v1/chat/completions` 到本地 OpenAI 兼容上游。`key-auth` 仅对 `auth.local` 和 `ai.local` 生效；`ai-proxy` 仅对 `ai.local` 生效。两者用 `matchRules.domain` 匹配 Host。曾尝试用带命名空间前缀的 `matchRules.ingress`，插件配置虽成功下发但该环境的网关路由名为无前缀的 `codex-key-auth-demo` 等，实际请求未命中规则；改为域名匹配后鉴权正常。
+
+4. **检查 xDS/ECDS 已下发且镜像已加载。**下面命令在本机看到 `codex-key-auth`、`codex-ai-proxy` 的 OCI URL 与 ECDS 配置；两者 `update_success` 为正数，`config_fail` 和 `update_rejected` 为 0。Registry 日志显示 Gateway 对两镜像的 Manifest 和 Blob 均取得 `200`：
+
+   ```bash
+   kubectl --context higress-dev -n higress-system exec deployment/higress-controller -c discovery -- \
+     curl -fsS 'http://127.0.0.1:15014/debug/configz?pretty' | \
+     rg -m 4 'codex-key-auth|codex-ai-proxy'
+   kubectl --context higress-dev -n higress-system exec deployment/higress-gateway -c higress-gateway -- \
+     curl -fsS 'http://127.0.0.1:15000/config_dump' | \
+     rg -m 4 'codex-key-auth|codex-ai-proxy'
+   kubectl --context higress-dev -n higress-system exec deployment/higress-gateway -c higress-gateway -- \
+     curl -fsS 'http://127.0.0.1:15000/stats' | \
+     rg 'extension_config_discovery.*codex-(key-auth|ai-proxy).*(update_success|config_fail|update_rejected):'
+   kubectl --context higress-dev -n higress-system logs deployment/codex-wasm-registry -c registry --since=15m | \
+     rg 'GET /v2/(key-auth|ai-proxy)/(manifests|blobs)' | tail -n 12
+   ```
+
+5. **验证 key-auth 的拒绝和放行。**这些是实际经过 Gateway NodePort 的请求，不是直接调用上游：
+
+   ```bash
+   curl -sS -i -H 'Host: auth.local' \
+     http://127.0.0.1:18080/auth/test
+   curl -sS -i -H 'Host: auth.local' -H 'x-api-key: wrong-key' \
+     http://127.0.0.1:18080/auth/test
+   curl -sS -i -H 'Host: auth.local' -H 'x-api-key: codex-local-example-key' \
+     http://127.0.0.1:18080/auth/test
+   ```
+
+   实际返回依次为 `401`（无 Key）、`403`（消费者未授权）、`200 codex-xds-ok`（正确 Key）。Gateway access log 的拒绝原因分别为 `via_wasm::higress-system.codex-key-auth::key-auth.no_key` 和 `via_wasm::higress-system.codex-key-auth::key-auth.unauthorized`。
+
+6. **验证两个插件在 AI 路由上协同工作。**未带 Key 的请求被 `key-auth` 拒绝；带演示 Key 的请求经过 `ai-proxy`，模拟上游收到映射后的模型名和配置的 Bearer token：
+
+   ```bash
+   curl -sS -i -H 'Host: ai.local' -H 'Content-Type: application/json' \
+     --data '{"model":"demo-model","messages":[{"role":"user","content":"hi"}]}' \
+     http://127.0.0.1:18080/v1/chat/completions
+   curl -sS -i -H 'Host: ai.local' -H 'Content-Type: application/json' \
+     -H 'x-api-key: codex-local-example-key' \
+     --data '{"model":"demo-model","messages":[{"role":"user","content":"hi"}]}' \
+     http://127.0.0.1:18080/v1/chat/completions
+   ```
+
+   首个请求实测 `401`。第二个返回 `200`，JSON 中 `model: "mock-model"`、`choices[0].message.content: "mock-ai-ok"`，`codex_debug.authorization: "Bearer mock-upstream-token"`、`codex_debug.consumer: "codex-demo"`，同时上游看到 `Host: codex-ai-mock.higress-system.svc.cluster.local`。这验证本地模拟上游的协议转换、模型映射、上游 Token 和鉴权上下文；**没有验证真实 AI 服务提供商的调用或账单**。
+
+7. **关闭宿主机 Registry 端口转发后做冷启动复验。**在终端 A 停止第 2 步的 `port-forward`，再执行：
+
+   ```bash
+   kubectl --context higress-dev -n higress-system rollout restart deployment/higress-gateway
+   kubectl --context higress-dev -n higress-system rollout status deployment/higress-gateway --timeout=180s
+   kubectl --context higress-dev -n higress-system logs deployment/higress-gateway -c higress-gateway --since=3m | \
+     rg 'fetching image (key-auth|ai-proxy)'
+   kubectl --context higress-dev -n higress-system exec deployment/higress-gateway -c higress-gateway -- \
+     curl -fsS 'http://127.0.0.1:15000/stats' | \
+     rg 'extension_config_discovery.*codex-(key-auth|ai-proxy).*(update_success|config_fail|update_rejected):'
+   curl -sS -o /dev/null -w 'no-key=%{http_code}\n' -H 'Host: auth.local' \
+     http://127.0.0.1:18080/auth/test
+   curl -sS -o /dev/null -w 'valid-key=%{http_code}\n' -H 'Host: auth.local' \
+     -H 'x-api-key: codex-local-example-key' http://127.0.0.1:18080/auth/test
+   curl -sS -H 'Host: ai.local' -H 'Content-Type: application/json' \
+     -H 'x-api-key: codex-local-example-key' \
+     --data '{"model":"demo-model","messages":[{"role":"user","content":"hi"}]}' \
+     http://127.0.0.1:18080/v1/chat/completions
+   ```
+
+   新 Gateway 再次从集群 Service 拉取两个 OCI 镜像；Registry 的 Manifest/Blob 均为 `200`。两插件的 `update_success: 2`、`config_fail: 0`、`update_rejected: 0`；冷启动后的无 Key 请求仍为 `401`、正确 Key 为 `200`、AI 模拟请求为 `200` 且模型/Token 映射保持正确。原 `request-block` 路由也保持允许路径 `200`、屏蔽路径 `403`。
 
 ## 调试手册：xDS、Gateway、Wasm
 
@@ -446,11 +698,14 @@ kubectl --context higress-dev -n higress-system logs deployment/higress-gateway 
   rg 'response_code_details'
 ```
 
-第一段没有路由时，检查 Ingress 的 `ingressClassName: higress`、namespace、CRD 和 `higress-core` 日志。第一段有而第二段没有时，检查 controller 到 pilot 的配置传递；`totalClients:0` 时查 Gateway 到 `higress-controller:15012` 的连接、证书及 `discovery` 日志。第二段有而 Envoy 没有时，重点查 ADS/NACK 和版本兼容。Envoy 已有路由但返回 404 时核对 Host 与路径；503 时查看后端 endpoints 和 Envoy `/clusters`。Wasm 不生效时先核对文件 URL 的 `200`、ECDS 的 `config_fail/update_rejected`，再查 Gateway 日志；实测屏蔽请求日志的 `response_code_details` 为 `via_wasm::higress-system.codex-request-block::request-block.url_blocked.keyword`。
+第一段没有路由时，检查 Ingress 的 `ingressClassName: higress`、namespace、CRD 和 `higress-core` 日志。第一段有而第二段没有时，检查 controller 到 pilot 的配置传递；`totalClients:0` 时查 Gateway 到 `higress-controller:15012` 的连接、证书及 `discovery` 日志。第二段有而 Envoy 没有时，重点查 ADS/NACK 和版本兼容。Envoy 已有路由但返回 404 时核对 Host 与路径；503 时查看后端 endpoints 和 Envoy `/clusters`。最终 OCI 方式下 Wasm 不生效时，先核对 Registry PVC/Pod、`/v2/` 与镜像 Manifest 是否可达，再核对 Gateway 的 `WASM_INSECURE_REGISTRIES`、Registry 的 Manifest/Blob 访问日志、ECDS 的 `config_fail/update_rejected` 和 Gateway 拉取日志。若 ECDS 成功而 `key-auth` 无 Key 请求仍是 200，检查 ECDS 配置中的 `_match_domain_` 或 `_match_route_` 是否与真实 Host/Envoy 路由名一致；此环境用域名规则成功命中。实测拒绝请求的 `response_code_details` 包括 `via_wasm::higress-system.codex-key-auth::key-auth.no_key` 和 `via_wasm::higress-system.codex-request-block::request-block.url_blocked.keyword`。
 
-此示例清理由下列两条命令完成（**本次未执行，以保留可复验的运行环境**）：
+此示例可由下列命令清理（**本次未执行，以保留可复验的运行环境**）：
 
 ```bash
-kubectl --context higress-dev delete -f infra/minikube/codex-request-block.yaml
+kubectl --context higress-dev delete -f infra/minikube/codex-ai-key-demo.yaml
+kubectl --context higress-dev delete -f infra/minikube/codex-request-block-oci.yaml
+kubectl --context higress-dev -n higress-system delete deployment/codex-wasm-host service/codex-wasm-host
+kubectl --context higress-dev delete -f infra/minikube/codex-wasm-registry.yaml
 kubectl --context higress-dev delete -f infra/minikube/codex-xds-demo.yaml
 ```

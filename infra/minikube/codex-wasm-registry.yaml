@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: codex-wasm-registry-data
+  namespace: higress-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codex-wasm-registry
+  namespace: higress-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: codex-wasm-registry
+  template:
+    metadata:
+      labels:
+        app: codex-wasm-registry
+    spec:
+      containers:
+        - name: registry
+          image: registry:2.8.3
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 5000
+          readinessProbe:
+            httpGet:
+              path: /v2/
+              port: http
+            periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/registry
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: codex-wasm-registry-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codex-wasm-registry
+  namespace: higress-system
+spec:
+  selector:
+    app: codex-wasm-registry
+  ports:
+    - name: http
+      port: 5000
+      targetPort: http

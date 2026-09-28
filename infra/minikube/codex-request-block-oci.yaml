@@ -1,0 +1,14 @@
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: codex-request-block
+  namespace: higress-system
+spec:
+  defaultConfig:
+    block_urls:
+      - /demo/blocked
+    blocked_code: 403
+    blocked_message: codex-wasm-blocked
+  phase: AUTHN
+  priority: 310
+  url: oci://codex-wasm-registry.higress-system.svc.cluster.local:5000/request-block:2.2.4
