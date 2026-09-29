@@ -1,0 +1,44 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: codex-official-key-auth-demo
+  namespace: higress-system
+spec:
+  ingressClassName: higress
+  rules:
+    - host: official.local
+      http:
+        paths:
+          - path: /official
+            pathType: Prefix
+            backend:
+              service:
+                name: codex-xds-echo
+                port:
+                  number: 5678
+---
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: codex-official-key-auth
+  namespace: higress-system
+spec:
+  defaultConfig:
+    consumers:
+      - name: codex-official-demo
+        credential: codex-official-example-key
+    global_auth: false
+    keys:
+      - x-api-key
+    in_header: true
+  defaultConfigDisable: false
+  matchRules:
+    - domain:
+        - official.local
+      config:
+        allow:
+          - codex-official-demo
+  phase: AUTHN
+  priority: 310
+  imagePullSecret: codex-private-wasm-pull
+  url: oci://codex-private-wasm-registry.higress-system.svc.cluster.local:5000/plugins/key-auth:2.0.0

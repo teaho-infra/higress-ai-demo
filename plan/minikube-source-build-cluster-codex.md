@@ -789,6 +789,117 @@
    PY
    ```
 
+## 官方 Wasm 插件私有化到本机 OCI Registry
+
+本节在 2026-09-29 已实际完成。这里“插件库指向本地库”包含两个动作：把官方 OCI artifact 原样镜像到集群内 Registry，以及让 Console **内置插件目录新生成的配置**使用该 Registry。仅改 Console 环境变量不会自动复制镜像，也不会改写此前保存的 WasmPlugin CR。
+
+### 推荐方案与容量评估
+
+- 以正在运行的 Higress Console `v2.2.4` 的 [`plugins.properties`](https://github.com/higress-group/higress-console/blob/v2.2.4/backend/sdk/src/main/resources/plugins/plugins.properties) 为清单，而不是猜测“50 个”或镜像仓库的全部历史标签：该清单实测是 **52 个插件条目、52 个镜像引用**，且每个插件都有规格文件。镜像均在 `higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/`，版本随插件而异。升级 Console 时先重新核对清单，再镜像新增版本。
+- 用 [ORAS `cp`](https://oras.land/docs/commands/oras_cp/) 跨仓库复制 OCI artifact，保留 Higress Wasm 的 Manifest、专用 media type 和摘要；逐个比较源与目标的 digest。`docker tag/push` 适合前面自行构建的普通镜像，不适合作为这批官方 Wasm artifact 的默认迁移方式。官方插件的 OCI layer 类型包含 `application/vnd.module.wasm.content.layer.v1+wasm`。
+- 52 个官方 Manifest 全部可访问，层与配置文件的压缩大小合计约 **0.128 GiB**；实际镜像后 Registry 数据目录占 **139.4 MiB**。本机检查时可用内存约 **24 GiB**、空闲磁盘约 **492 GiB**，现有 1 GiB PVC 容得下这一次固定版本快照，因此本机 Minikube 搭建可行。后续版本、临时上传和回滚会增长用量；长期环境建议至少 2 GiB 并监控 PVC、定期备份。当前 Registry 使用集群内 HTTP + Basic Auth，适合本机实验；正式私有化部署应加可信 TLS、独立凭据管理、备份与固定 digest/版本清单。
+- 目标地址为 `codex-private-wasm-registry.higress-system.svc.cluster.local:5000/plugins/<name>:<version>`，沿用上一节已运行的 Basic Auth、PVC 和 `codex-private-wasm-pull`。Higress Gateway 的 `WASM_INSECURE_REGISTRIES` 已包含此实验用 HTTP Registry。Console 的 `pluginServer.imageRegistry`、`pluginServer.imageNamespace` 和 `HIGRESS_ADMIN_WASM_PLUGIN_IMAGE_PULL_SECRET` 见 [`console-values.yaml`](../infra/minikube/console-values.yaml)。这是 Higress 官方[内置插件镜像地址配置](https://higress.ai/en/docs/latest/ops/how-tos/builtin-plugin-url/)支持的路径；该文档也说明既有插件配置不会因为地址设置变化而自动更新。若使用 Console 的 Nacos MCP 集成功能，controller 的 `MCP_SERVER_WASM_IMAGE_URL` 是另一处独立设置，不能被 Console 配置替代。
+
+### 已执行的同步、配置与验证命令
+
+以下命令在仓库目录执行。要求上一节的 `higress-dev`、私有 Registry、`codex-private-wasm-pull` Secret 已就绪，且 `/home/teaho/IdeaProjects/agentspace/higress-console` 检出 `v2.2.4`；`oras` 已安装。先从 Kubernetes Secret 在本机生成仅供推送使用的 ORAS 凭据文件，命令不会把密码写进 Git 或终端输出：
+
+```bash
+cd /home/teaho/IdeaProjects/teaho-infra/higress-ai-demo
+git -C /home/teaho/IdeaProjects/agentspace/higress-console describe --tags --exact-match HEAD
+rg -c '^[a-z0-9-]+=oci://' \
+  /home/teaho/IdeaProjects/agentspace/higress-console/backend/sdk/src/main/resources/plugins/plugins.properties
+python3 - <<'PY'
+import base64, json, subprocess
+from pathlib import Path
+
+raw = subprocess.check_output([
+    'kubectl', '--context', 'higress-dev', '-n', 'higress-system',
+    'get', 'secret', 'codex-private-wasm-pull', '-o', 'json'
+])
+secret = json.loads(raw)
+docker_config = json.loads(base64.b64decode(secret['data']['.dockerconfigjson']))
+credential = docker_config['auths'][
+    'codex-private-wasm-registry.higress-system.svc.cluster.local:5000'
+]
+root = Path('/tmp/higress-official-mirror')
+root.mkdir(mode=0o700, exist_ok=True)
+config = root / 'config.json'
+config.write_text(json.dumps({'auths': {'localhost:15006': credential}}))
+config.chmod(0o600)
+PY
+```
+
+第一行版本输出 `v2.2.4`，条目数输出 `52`。终端 A 保持本机端口转发；终端 B 使用可重入的 [`mirror-official-wasm-plugins.sh`](../infra/minikube/mirror-official-wasm-plugins.sh) 逐个复制并校验。脚本遇到官方仓库偶发的认证 EOF 会重试，已存在且 digest 一致的目标会跳过复制。**勿将目标仓库设为公开可写或省略认证。**
+
+```bash
+# 终端 A
+kubectl --context higress-dev -n higress-system port-forward \
+  service/codex-private-wasm-registry 15006:5000 --address 127.0.0.1
+
+# 终端 B
+bash infra/minikube/mirror-official-wasm-plugins.sh \
+  /home/teaho/IdeaProjects/agentspace/higress-console/backend/sdk/src/main/resources/plugins/plugins.properties \
+  /tmp/higress-official-mirror/config.json
+oras resolve higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/key-auth:2.0.0
+oras resolve --plain-http --registry-config /tmp/higress-official-mirror/config.json \
+  localhost:15006/plugins/key-auth:2.0.0
+kubectl --context higress-dev -n higress-system exec \
+  deployment/codex-private-wasm-registry -c registry -- du -sh /var/lib/registry
+```
+
+实测最后输出 `Verified 52 plugin artifacts`；`key-auth:2.0.0` 源与目标均为 `sha256:c9cddda9b7dc36b8260afd10d12a089556a070dba28b0b17691e18efc0ca545c`，Registry 数据目录约 `139.4M`。终端 A 在同步后 `Ctrl+C` 停止；后面的 Gateway 冷启动验证不依赖端口转发。
+
+Helm 配置把 Console 内置目录切到本地地址，并为新建的内置插件带上拉取 Secret。验证 chart 渲染后部署：
+
+```bash
+/home/teaho/.local/bin/helm lint /home/teaho/IdeaProjects/agentspace/higress-console/helm \
+  -f infra/minikube/console-values.yaml
+/home/teaho/.local/bin/helm upgrade higress-console \
+  /home/teaho/IdeaProjects/agentspace/higress-console/helm \
+  --kube-context higress-dev -n higress-system \
+  -f infra/minikube/console-values.yaml --wait --timeout=3m
+kubectl --context higress-dev -n higress-system exec deployment/higress-console -- \
+  printenv | rg '^HIGRESS_ADMIN_WASM_PLUGIN_(IMAGE_REGISTRY|IMAGE_NAMESPACE|IMAGE_PULL_SECRET)='
+```
+
+实测 Console release 为 `deployed`，三个值分别为 `codex-private-wasm-registry.higress-system.svc.cluster.local:5000`、`plugins` 和 `codex-private-wasm-pull`。登录 Console 后读取 `/v1/wasm-plugins`，52 个内置条目的 `imageRepository` 全部指向 `oci://codex-private-wasm-registry.higress-system.svc.cluster.local:5000/plugins/`，`imagePullSecret` 全部为 `codex-private-wasm-pull`；其中 `key-auth` 版本为 `2.0.0`、`ai-proxy` 为 `2.0.1`。已有手工创建的源构建示例 CR 仍保留各自的镜像引用；如需一并迁移，应逐项修改其 CR 并验证行为。
+
+使用镜像后的**官方** `key-auth` 做真实网关验证。它独立于前面源码构建的 `codex-private-key-auth`，因此可同时测试两条路径：
+
+```bash
+kubectl --context higress-dev apply -f infra/minikube/codex-official-key-auth.yaml
+kubectl --context higress-dev -n higress-system get wasmplugin codex-official-key-auth \
+  -o jsonpath='{.spec.imagePullSecret}{" "}{.spec.url}{"\n"}'
+kubectl --context higress-dev -n higress-system rollout restart deployment/higress-gateway
+kubectl --context higress-dev -n higress-system rollout status \
+  deployment/higress-gateway --timeout=180s
+curl -sS -i -H 'Host: official.local' http://127.0.0.1:18080/official/test
+curl -sS -i -H 'Host: official.local' -H 'x-api-key: codex-official-example-key' \
+  http://127.0.0.1:18080/official/test
+curl -sS -i -H 'Host: official.local' -H 'x-api-key: wrong-key' \
+  http://127.0.0.1:18080/official/test
+kubectl --context higress-dev -n higress-system exec deployment/higress-gateway -c higress-gateway -- \
+  curl -fsS http://127.0.0.1:15000/stats | \
+  rg 'extension_config_discovery.*codex-official-key-auth.*(update_success|update_rejected|config_fail):'
+kubectl --context higress-dev -n higress-system logs \
+  deployment/codex-private-wasm-registry -c registry --since=3m | \
+  rg 'GET /v2/plugins/key-auth/(manifests|blobs)' | tail -n 5
+```
+
+停掉本机转发后冷启动，三种请求实测依次为 `401`、`200 codex-xds-ok`、`401`（官方插件对错误 Key 也返回 `401`）；ECDS `update_success: 2`、`config_fail: 0`、`update_rejected: 0`。Registry 记录新 Gateway Pod 对 `plugins/key-auth:2.0.0` 的 Manifest 和 Blob 均为 `200`，证明它实际从集群内私有库加载，而非复用本机转发。已有的 `ai-proxy` 和源码私有 `key-auth` 路由在 Console 切换后也保持正常。
+
+本机临时 ORAS 凭据可在同步完成后删除，Kubernetes Secret 不受影响：
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+root = Path('/tmp/higress-official-mirror')
+(root / 'config.json').unlink(missing_ok=True)
+root.rmdir()
+PY
+```
+
 ## 调试手册：xDS、Gateway、Wasm
 
 在此环境始终显式指定 `--context higress-dev`，以免误查其他 Kubernetes 集群。路径在当前 Helm release 下依次是：Kubernetes Ingress/Service/WasmPlugin → `higress-core` 配置快照 `:8888` → `discovery`/pilot 配置快照与 ADS 连接 `:15014` → Gateway Envoy `:15000` → 真实 HTTP 请求。

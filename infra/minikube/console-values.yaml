@@ -9,6 +9,14 @@ image:
   tag: v2.2.4
   pullPolicy: IfNotPresent
 
+# Built-in Wasm catalog images are mirrored from the pinned v2.2.4 plugin list.
+pluginServer:
+  imageRegistry: codex-private-wasm-registry.higress-system.svc.cluster.local:5000
+  imageNamespace: plugins
+
+podEnvs:
+  HIGRESS_ADMIN_WASM_PLUGIN_IMAGE_PULL_SECRET: codex-private-wasm-pull
+
 service:
   type: NodePort
   port: 8080
