@@ -8,6 +8,7 @@
 - 用 Docker driver 启动独立的 Minikube 单节点集群，Helm 部署 `higress-system` 中的 core 和 console。
 - 用真实 Ingress 证明 controller → pilot → gateway 的 xDS 配置下发，以 Envoy `config_dump` 和 HTTP 响应双重验证。
 - 从 Higress 源码编译 `request-block`、`key-auth`、`ai-proxy` Wasm 插件，打包并推送 OCI 镜像到 Minikube 内的 Registry，通过 `oci://` 部署，证明插件配置下发与实际执行；使用本地 OpenAI 兼容模拟服务验证 AI 请求，不需要真实模型 API Key。
+- 用带 Basic Auth 的独立私有 OCI Registry 和 `imagePullSecret` 再验证 `key-auth` 插件的存储、认证拉取及 Gateway 冷启动。
 
 ## 本机约束
 
@@ -26,6 +27,7 @@
 | Minikube 与 Helm 部署 | 完成 | `higress-dev` 节点 Ready；两套 Helm release 为 `deployed`；Controller、Gateway、Console、回显后端、OCI Registry 均 Ready，旧 HTTP Wasm 服务缩为 0 |
 | xDS 与 gateway 验证 | 完成 | controller、pilot、Envoy 三段可见路由；ADS 客户端 1 个；路由更新后新域名 200、旧域名 404，恢复亦成功 |
 | Wasm 插件验证 | 完成 | 三个 `oci://` 镜像从集群 Registry 拉取；request-block 允许路径 200、屏蔽路径 403；key-auth 无 Key 401、错误 Key 403、正确 Key 200；ai-proxy 把 `demo-model` 映射为 `mock-model`，上游收到 `Bearer mock-upstream-token`，模拟响应 200；ECDS 拒绝 0 |
+| 私有 Wasm Registry | 完成 | 独立 Registry 绑定 1 GiB PVC；匿名访问镜像 401、认证访问 200；`imagePullSecret` 使 Gateway 冷启动后再次认证拉取 `key-auth`，私有路由无 Key 401、错 Key 403、对 Key 200 |
 
 ## 成功命令逐条记录
 
@@ -665,6 +667,128 @@
 
    新 Gateway 再次从集群 Service 拉取两个 OCI 镜像；Registry 的 Manifest/Blob 均为 `200`。两插件的 `update_success: 2`、`config_fail: 0`、`update_rejected: 0`；冷启动后的无 Key 请求仍为 `401`、正确 Key 为 `200`、AI 模拟请求为 `200` 且模型/Token 映射保持正确。原 `request-block` 路由也保持允许路径 `200`、屏蔽路径 `403`。
 
+## 带认证的私有 OCI Registry 再验证 Wasm
+
+2026-09-29 本机 `MemAvailable` 约 24 GiB，`higress-dev` 与原有服务均为 Ready，因此在同一 Minikube 中增加一套**独立** Registry，不改动上一章的公开演示 Registry。这里的“私有”指集群内 Service + PVC 存储 + Registry Basic Auth + Higress `imagePullSecret`；使用 HTTP 仅限这台本机的 Minikube 实验。生产环境还需要可信 TLS、独立凭据管理和存储备份。密码随机生成，仅进入临时本机文件和 Kubernetes Secret，不写入 Git。
+
+1. **生成 Registry 认证与插件拉取 Secret。**Registry 2.8.3 在本机验证中使用 bcrypt 格式的 htpasswd；APR1 格式会使带密码请求也返回 `401`。在仓库目录执行：
+
+   ```bash
+   cd /home/teaho/IdeaProjects/teaho-infra/higress-ai-demo
+   install -d -m 700 /tmp/higress-private-wasm-demo
+   umask 077
+   openssl rand -hex 24 > /tmp/higress-private-wasm-demo/password
+   python3 - <<'PY'
+   from pathlib import Path
+   import bcrypt
+   root = Path('/tmp/higress-private-wasm-demo')
+   password = root.joinpath('password').read_bytes().strip()
+   root.joinpath('htpasswd').write_bytes(
+       b'codex-wasm:' + bcrypt.hashpw(password, bcrypt.gensalt(rounds=12)) + b'\n'
+   )
+   PY
+   kubectl --context higress-dev -n higress-system create secret generic codex-private-wasm-htpasswd \
+     --from-file=htpasswd=/tmp/higress-private-wasm-demo/htpasswd \
+     --dry-run=client -o yaml | kubectl --context higress-dev apply -f -
+   kubectl --context higress-dev -n higress-system create secret docker-registry codex-private-wasm-pull \
+     --docker-server=codex-private-wasm-registry.higress-system.svc.cluster.local:5000 \
+     --docker-username=codex-wasm \
+     --docker-password="$(cat /tmp/higress-private-wasm-demo/password)" \
+     --dry-run=client -o yaml | kubectl --context higress-dev apply -f -
+   kubectl --context higress-dev -n higress-system get secret codex-private-wasm-pull \
+     -o jsonpath='{.type}{"\n"}'
+   ```
+
+   拉取 Secret 的类型实测为 `kubernetes.io/dockerconfigjson`。`WasmPlugin.spec.imagePullSecret` 引用的 Secret 必须与插件 CR 同在 `higress-system`；它不同于 Gateway Pod 的 `imagePullSecrets`。
+
+2. **部署独立持久化 Registry。**[codex-private-wasm-registry.yaml](../infra/minikube/codex-private-wasm-registry.yaml) 包含 `registry:2.8.3`、集群内 Service 和 1 GiB PVC，挂载上一步的 htpasswd Secret。由于匿名 `/v2/` 正常返回 `401`，这里用 TCP readiness probe。执行：
+
+   ```bash
+   kubectl --context higress-dev apply -f infra/minikube/codex-private-wasm-registry.yaml
+   kubectl --context higress-dev -n higress-system rollout status \
+     deployment/codex-private-wasm-registry --timeout=120s
+   kubectl --context higress-dev -n higress-system get pvc codex-private-wasm-registry-data
+   ```
+
+   Deployment 为 `1/1`，PVC 为 `Bound`。
+
+3. **验证仓库认证并推送源码构建的 `key-auth` 镜像。**终端 A 保持运行：
+
+   ```bash
+   kubectl --context higress-dev -n higress-system port-forward \
+     service/codex-private-wasm-registry 15006:5000 --address 127.0.0.1
+   ```
+
+   终端 B 执行：
+
+   ```bash
+   curl -sS -o /dev/null -w 'anonymous=%{http_code}\n' http://127.0.0.1:15006/v2/
+   curl -sS -o /dev/null -w 'authenticated=%{http_code}\n' \
+     -u "codex-wasm:$(cat /tmp/higress-private-wasm-demo/password)" \
+     http://127.0.0.1:15006/v2/
+   install -d -m 700 /tmp/higress-private-wasm-demo/docker
+   docker tag localhost:15005/key-auth:2.2.4 localhost:15006/key-auth:2.2.4
+   cat /tmp/higress-private-wasm-demo/password | \
+     docker --config /tmp/higress-private-wasm-demo/docker login localhost:15006 \
+       --username codex-wasm --password-stdin
+   docker --config /tmp/higress-private-wasm-demo/docker push localhost:15006/key-auth:2.2.4
+   curl -sS -o /dev/null -w 'anonymous_manifest=%{http_code}\n' \
+     -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+     http://127.0.0.1:15006/v2/key-auth/manifests/2.2.4
+   curl -sS -o /dev/null -w 'authenticated_manifest=%{http_code}\n' \
+     -u "codex-wasm:$(cat /tmp/higress-private-wasm-demo/password)" \
+     -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+     http://127.0.0.1:15006/v2/key-auth/manifests/2.2.4
+   ```
+
+   `/v2/` 和 Manifest 均为匿名 `401`、认证后 `200`。镜像来自前一章本机编译的 `key-auth` Wasm，推送摘要 `sha256:632f1f2894f03f25e49623290bc9e31fd11829508eafe9cf12f2ea5a84ef5051`。终端 A 在推送后用 `Ctrl+C` 停止；临时 Docker 配置仅用于本机推送。
+
+4. **部署 Higress 私有插件。**[higress-values.yaml](../infra/minikube/higress-values.yaml) 的 `WASM_INSECURE_REGISTRIES` 现同时列出两套集群内 HTTP Registry。[codex-private-key-auth.yaml](../infra/minikube/codex-private-key-auth.yaml) 给 `private.local/private` 路由配置独立的 `key-auth` WasmPlugin，并设置 `imagePullSecret: codex-private-wasm-pull`。执行：
+
+   ```bash
+   /home/teaho/.local/bin/helm lint /home/teaho/IdeaProjects/agentspace/higress/helm/core \
+     -f infra/minikube/higress-values.yaml
+   /home/teaho/.local/bin/helm upgrade higress /home/teaho/IdeaProjects/agentspace/higress/helm/core \
+     --kube-context higress-dev -n higress-system \
+     -f infra/minikube/higress-values.yaml --wait --timeout=3m
+   kubectl --context higress-dev apply -f infra/minikube/codex-private-key-auth.yaml
+   kubectl --context higress-dev -n higress-system get wasmplugin codex-private-key-auth \
+     -o jsonpath='{.spec.imagePullSecret}{" "}{.spec.url}{"\n"}'
+   ```
+
+   Helm core 为 `deployed`（revision 3），插件 CR 指向私有 Service 的 OCI URL。Gateway 日志出现 `fetching image key-auth from registry codex-private-wasm-registry...:5000`；Registry 日志显示 Gateway Pod **认证成功**，Manifest 和 Blob 均返回 `200`。Envoy ECDS 的该插件 `update_success: 2`、`config_fail: 0`、`update_rejected: 0`。
+
+5. **真实入口与冷启动验证。**停掉终端 A 的端口转发后执行：
+
+   ```bash
+   kubectl --context higress-dev -n higress-system rollout restart deployment/higress-gateway
+   kubectl --context higress-dev -n higress-system rollout status deployment/higress-gateway --timeout=180s
+   curl -sS -i -H 'Host: private.local' http://127.0.0.1:18080/private/test
+   curl -sS -i -H 'Host: private.local' -H 'x-api-key: wrong-key' \
+     http://127.0.0.1:18080/private/test
+   curl -sS -i -H 'Host: private.local' -H 'x-api-key: codex-private-example-key' \
+     http://127.0.0.1:18080/private/test
+   kubectl --context higress-dev -n higress-system exec deployment/higress-gateway -c higress-gateway -- \
+     curl -fsS 'http://127.0.0.1:15000/stats' | \
+     rg 'extension_config_discovery.*codex-private-key-auth.*(update_success|update_rejected|config_fail):'
+   kubectl --context higress-dev -n higress-system logs deployment/codex-private-wasm-registry -c registry --since=3m | \
+     rg 'GET /v2/key-auth/(manifests|blobs)' | tail -n 6
+   ```
+
+   冷启动后私有路由依次返回 `401`、`403`、`200 codex-xds-ok`；Registry 再次记录新 Gateway Pod 对 Manifest/Blob 的认证拉取，ECDS 拒绝和配置失败均为 0。原 `request-block` 仍返回预期的 `403`，`ai-proxy` 模拟请求仍返回映射后的模型与 Token。可以删除本机临时密码和 Docker 配置，集群中的两个 Secret 不受影响：
+
+   ```bash
+   python3 - <<'PY'
+   from pathlib import Path
+   root = Path('/tmp/higress-private-wasm-demo')
+   for name in ('password', 'htpasswd'):
+       root.joinpath(name).unlink(missing_ok=True)
+   (root / 'docker' / 'config.json').unlink(missing_ok=True)
+   (root / 'docker').rmdir()
+   root.rmdir()
+   PY
+   ```
+
 ## 调试手册：xDS、Gateway、Wasm
 
 在此环境始终显式指定 `--context higress-dev`，以免误查其他 Kubernetes 集群。路径在当前 Helm release 下依次是：Kubernetes Ingress/Service/WasmPlugin → `higress-core` 配置快照 `:8888` → `discovery`/pilot 配置快照与 ADS 连接 `:15014` → Gateway Envoy `:15000` → 真实 HTTP 请求。
@@ -703,6 +827,9 @@ kubectl --context higress-dev -n higress-system logs deployment/higress-gateway 
 此示例可由下列命令清理（**本次未执行，以保留可复验的运行环境**）：
 
 ```bash
+kubectl --context higress-dev delete -f infra/minikube/codex-private-key-auth.yaml
+kubectl --context higress-dev delete -f infra/minikube/codex-private-wasm-registry.yaml
+kubectl --context higress-dev -n higress-system delete secret codex-private-wasm-htpasswd codex-private-wasm-pull
 kubectl --context higress-dev delete -f infra/minikube/codex-ai-key-demo.yaml
 kubectl --context higress-dev delete -f infra/minikube/codex-request-block-oci.yaml
 kubectl --context higress-dev -n higress-system delete deployment/codex-wasm-host service/codex-wasm-host

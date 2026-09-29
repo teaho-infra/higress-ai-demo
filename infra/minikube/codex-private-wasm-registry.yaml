@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: codex-private-wasm-registry-data
+  namespace: higress-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codex-private-wasm-registry
+  namespace: higress-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: codex-private-wasm-registry
+  template:
+    metadata:
+      labels:
+        app: codex-private-wasm-registry
+    spec:
+      containers:
+        - name: registry
+          image: registry:2.8.3
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: REGISTRY_AUTH
+              value: htpasswd
+            - name: REGISTRY_AUTH_HTPASSWD_REALM
+              value: Higress Wasm Private Registry
+            - name: REGISTRY_AUTH_HTPASSWD_PATH
+              value: /auth/htpasswd
+          ports:
+            - name: http
+              containerPort: 5000
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/registry
+            - name: auth
+              mountPath: /auth
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: codex-private-wasm-registry-data
+        - name: auth
+          secret:
+            secretName: codex-private-wasm-htpasswd
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codex-private-wasm-registry
+  namespace: higress-system
+spec:
+  selector:
+    app: codex-private-wasm-registry
+  ports:
+    - name: http
+      port: 5000
+      targetPort: http

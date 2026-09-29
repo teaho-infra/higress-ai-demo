@@ -12,7 +12,7 @@ gateway:
   image: gateway
   # Local OCI registry used by the source-built Wasm plugins.
   env:
-    WASM_INSECURE_REGISTRIES: codex-wasm-registry.higress-system.svc.cluster.local:5000
+    WASM_INSECURE_REGISTRIES: codex-wasm-registry.higress-system.svc.cluster.local:5000,codex-private-wasm-registry.higress-system.svc.cluster.local:5000
   service:
     type: NodePort
     ports:
