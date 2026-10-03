@@ -98,6 +98,11 @@ else
 fi
 minikube kubectl -- rollout status deploy/higress-console -n "$NS" --timeout=180s || true
 
+# minikube --ports maps host 18001 to node port 30001. The console chart
+# does not set a fixed nodePort, so align the Service after installation.
+kubectl patch svc higress-console -n "$NS" --type=json \
+  -p='[{"op":"replace","path":"/spec/ports/0/nodePort","value":30001}]'
+
 # ---- 5. 免 host 访问 console (patch default ingress) -----------------------
 log "配置 default ingress 指向 console (免 host 访问) ..."
 kubectl patch ingress default -n "$NS" --type=json \
@@ -119,11 +124,14 @@ echo "== pods =="
 kubectl get pods -n "$NS"
 echo "== console(免host) =="
 curl -s -o /dev/null -w '18080/ http=%{http_code}\n' --max-time 8 http://127.0.0.1:18080/ || true
+echo "== console(直连) =="
+curl -s -o /dev/null -w '18001/ http=%{http_code}\n' --max-time 8 http://127.0.0.1:18001/ || true
 echo "== downstream(数据面) =="
 curl -s -o /dev/null -w '18080/demo/time http=%{http_code}\n' --max-time 8 -H 'Host: demo.local' \
   http://127.0.0.1:18080/demo/time || true
 
 log "完成! 访问:"
 echo "  Console    : http://127.0.0.1:18080/        (免 host)"
+echo "  Console直连: http://127.0.0.1:18001/"
 echo "  Gateway    : http://127.0.0.1:18080/ + Host: console.higress.io"
 echo "  (端口映射: 18080→30080 http / 18443→30443 https / 18001→30001)"
