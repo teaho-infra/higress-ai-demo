@@ -66,3 +66,6 @@ infra/docker-compose.override.yml
 # --- Local IDE / Hermes ---
 .idea/
 *.swp
+
+wasm/
+.agent/skill/guizang-social-card-skill/
