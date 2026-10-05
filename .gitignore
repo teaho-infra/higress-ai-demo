@@ -67,5 +67,7 @@ infra/docker-compose.override.yml
 .idea/
 *.swp
 
-wasm/
+wasm/**/*.tar
+wasm/**/*.gz
+wasm/**/*.wasm
 .agent/skill/guizang-social-card-skill/
