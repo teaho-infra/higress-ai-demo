@@ -1,0 +1,46 @@
+# 在 Higress 源码根目录执行；本文件只调度 Docker，容器内调用官方 Make 规则。
+SHELL := /bin/bash
+.SHELLFLAGS := -eu -o pipefail -c
+.DEFAULT_GOAL := docker-build
+.NOTPARALLEL:
+DOCKER ?= docker
+HUB ?= harbor.qa.wal-mart.cn/nonprod-ai-gateway
+TAG ?= 2.2.5-walmart
+BASE_IMAGE ?=
+BUILD_TOOLS_IMAGE ?=
+GOPROXY ?= http://cno-repository.cn.wal-mart.com/repository/GoproxCn/
+SOURCE_REVISION ?= $(shell git rev-parse HEAD)
+export DOCKER_BUILDKIT := 1
+BUILD_ARGS = --platform linux/amd64 \
+	--build-arg "BASE_IMAGE=$(BASE_IMAGE)" \
+	--build-arg "BUILD_TOOLS_IMAGE=$(BUILD_TOOLS_IMAGE)" \
+	--build-arg "GOPROXY=$(GOPROXY)" \
+	--build-arg "SOURCE_REVISION=$(SOURCE_REVISION)" \
+	--build-arg "BUILD_VERSION=$(TAG)"
+.PHONY: check-inputs docker-build docker-build-controller docker-build-gateway docker-check docker-push
+check-inputs:
+	@test -n "$(BASE_IMAGE)" && test -n "$(BUILD_TOOLS_IMAGE)" || { echo '请设置已导入 Harbor 的 BASE_IMAGE 和 BUILD_TOOLS_IMAGE。' >&2; exit 1; }
+	@test -s go.mod && test -d cmd/higress && test -s prepare-source.sh
+	@test -s offline/go1.26.0.linux-amd64.tar.gz && test -s offline/go.SHA256SUMS
+
+docker-build: docker-build-controller docker-build-gateway
+
+docker-build-controller: check-inputs
+	$(DOCKER) build $(BUILD_ARGS) -f Dockerfile.controller --target controller -t "$(HUB)/controller:$(TAG)" .
+	$(DOCKER) build $(BUILD_ARGS) -f Dockerfile.controller --target discovery -t "$(HUB)/discovery:$(TAG)" .
+
+docker-build-gateway: check-inputs
+	@test -s offline/envoy-symbol-amd64.tar.gz && test -s offline/supercronic-linux-amd64 && test -s offline/gateway.SHA256SUMS && test -s golang-filter-local-build.patch
+	$(DOCKER) build $(BUILD_ARGS) -f Dockerfile.gateway --target gateway -t "$(HUB)/gateway:$(TAG)" .
+
+docker-check:
+	$(DOCKER) run --rm --entrypoint /usr/local/bin/higress "$(HUB)/controller:$(TAG)" version
+	$(DOCKER) run --rm --entrypoint /usr/local/bin/pilot-discovery "$(HUB)/discovery:$(TAG)" version
+	$(DOCKER) run --rm --entrypoint /usr/local/bin/pilot-agent "$(HUB)/gateway:$(TAG)" version
+	$(DOCKER) run --rm --entrypoint /usr/local/bin/envoy "$(HUB)/gateway:$(TAG)" --version
+
+# 显式推送目标；编译和检查不会自动推送。
+docker-push:
+	$(DOCKER) push "$(HUB)/controller:$(TAG)"
+	$(DOCKER) push "$(HUB)/discovery:$(TAG)"
+	$(DOCKER) push "$(HUB)/gateway:$(TAG)"
