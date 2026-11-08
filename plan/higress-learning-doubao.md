@@ -8,10 +8,11 @@
 >
 > 先给最关键的结论（直接回答你核心疑问）：
 > ✅ **必须懂 Envoy，但不用做到 “Envoy 源码贡献者”；**
-> ⚠️ **Istio：只学「和 Higress 相关的子集」，**不要从头到尾系统啃完整 Istio；**Higress 是兼容 Istio API、但做了大量裁剪与增强的独立网关，不是 “把 Istio 搬过来”，很多 Istio 复杂组件（pilot 原生逻辑、sidecar 注入、mTLS 完整网格、Citadel、Galley 等）在 Higress 里要么被替换、要么直接不用**，全量学 Istio 性价比很低，容易被无关概念淹没。
+> ⚠️ **Istio：先学 Higress 使用的子集。** Higress 使用并扩展了 Istio/Pilot 的配置生成和 xDS 下发能力，不必先学习完整的 sidecar 服务网格，但不能把 Pilot 排除在学习范围之外。
 >
->
-> Higress 本质一句话：**基于 Envoy，自研控制面（替代 Istio Pilot），兼容大部分 Istio CRD，面向 “入口网关（Ingress Gateway）优先，弱化服务网格 Sidecar” 的云原生网关**；你工作主战场是**集群入口流量**，不是完整服务网格。
+> Higress 是基于 Envoy 的云原生网关。在本文对应的 Kubernetes 部署中，控制面由 **Higress Core + Pilot/discovery** 协作组成，通常同处 `higress-controller` Pod；Gateway 运行 agent 和 Envoy。无需额外安装完整 Istio，不代表 Higress 没有使用 Pilot。
+
+> 修订说明：依据本地 `higress/helm/core/templates/controller-deployment.yaml` 和 [本地开发与全链路调试](../../higress/docs/walmart/local-development-debugging.md) 修正架构表述。具体资源支持和启动方式以实际部署版本、Chart 开关及 CRD 为准。
 
 >
 > 目标定义（1 个月，生产接管合格标准）：
@@ -48,43 +49,32 @@
 
 **学习内容：**
 
-- Higress 两大块：**控制面（higress‑controller） + 数据面（higress‑gateway = 封装好的 Envoy）**
-- 纠正最大误区：
->
-> ❌ Higress ≠ Istio；**控制面是自研，不是 Istio Pilot；只是复用了 Istio 的 API 规范（Gateway API + Istio CRD：VirtualService/DestinationRule 等），**没有 istiod；**不要在集群里找 istiod！**
-- 组件清单，只记生产相关：
-  - `higress-controller`：唯一大脑；监听 K8s 资源（Ingress、Gateway、VirtualService、McpBridge、Higress* CRD）→ 生成 xDS 配置 → 通过 xDS 推送给下游 Envoy；**单点风险重点关注**
-  - `higress‑gateway`：Envoy Pod；**无本地配置文件！全部配置来自控制面 xDS；没有静态 envoy.yaml；这是和传统 Nginx 最大区别**
-  - 可选附加组件：`higress‑console`（可视化控制台，**只做展示和辅助提交 CR，不是真正控制面！不能绕过 controller 直接改 Envoy，很多新手踩坑**）、`higress‑cert‑agent`（证书自动管理）
-  - 注意：**Higress 默认不部署 sidecar；它的定位是集群入口网关，不是服务网格**；mTLS 是入口到后端服务的可选能力，不是默认全套网格。
+- 控制面：`higress-controller` Deployment 通常包含 Core 和 `discovery`（Pilot）两个容器。
+  - **Core**：监听 Ingress、McpBridge、WasmPlugin 等资源，将入口路由、服务发现和插件配置转换成内部配置。
+  - **Pilot/discovery**：消费配置源，生成 LDS/RDS/CDS/EDS 等 xDS 资源，并向 Gateway 下发；还可能直接监听相关 Kubernetes 资源。
+- 数据面：`higress-gateway` 中的 agent 负责 Envoy 启动及相关配置工作，Envoy 处理实际业务流量。Envoy 有启动用的 bootstrap 配置，路由等运行配置主要通过 xDS 动态获取，不能理解成“完全没有本地配置”。
+- 管理面：`higress-console` 包含前端、Java 后端和 SDK，负责查询及写入 Kubernetes 资源，部分服务查询访问 Pilot 的 `15014` 端口。它不是单纯的 UI，也不位于业务请求转发路径上。
+- 不要求安装完整 Istio 或给业务 Pod 注入 sidecar；TLS、证书与服务网格能力需结合实际配置理解，不假定存在独立的 `higress-cert-agent` 组件。
 
 **检查点：**
 
-- 能画 Mermaid 流程图：`K8s CR → higress‑controller → xDS → higress‑gateway(Envoy) → 后端Service/Pod`
+能分别画出配置链路和业务链路：
 
-预览
-
-查看代码
-
-生成失败，请重试
-
-```
+```mermaid
 flowchart LR
-    A[用户:kubectl apply CRD] --> B[K8s APIServer]
-    B --> C[higress‑controller<br/>控制面,监听资源,生成xDS]
-    C -->|xDS(CDS/EDS/RDS/LDS)| D[higress‑gateway<br/>Envoy 数据面]
-    D --> E[业务后端 Service]
+    UI[Console 前端与 Java SDK] --> K[Kubernetes API]
+    U[kubectl 创建或更新资源] --> K
+    K --> C[Higress Core]
+    C -->|配置源 15051| P[Pilot / discovery]
+    P -->|xDS| G[Gateway / Envoy]
+    CLIENT[业务客户端] --> G
+    G --> BACKEND[后端服务]
 ```
 
-生成失败，请重试
+- Core 负责入口配置转换，Pilot 负责 xDS 生成和下发，Gateway 负责实际转发；Console 保存成功不等于 Envoy 已接受新配置。
+- 集群里没有名为 `istiod` 的 Deployment，不代表没有 Pilot；查看 `higress-controller` 的容器和镜像确认实际组成。
 
-豆包
-
-你的 AI 助手，助力每日工作学习
-
-- 一句话区分：**controller 管 “规则怎么生成”；gateway (Envoy) 管 “流量实际怎么转发”；控制台只是 UI 壳。**
-
-**避坑：**不要花时间去读 Istio Pilot 的设计文档，现阶段没用。
+**学习范围：**先了解 Pilot 的配置源、xDS 推送和 ACK/NACK；深入调试时再读对应源码，无需先通读完整 Istio。
 
 ---
 
@@ -102,7 +92,12 @@ helm install higress higress.io/higress --namespace higress-system --create-name
 - 学会基础运维命令：
 ```
 # 看控制面日志（排障第一入口！！）
-kubectl logs -n higress-system deploy/higress-controller -f
+# 先确认真实容器名，再分别查看 Core 与 Pilot 日志
+kubectl -n higress-system get deploy higress-controller \
+  -o jsonpath='{.spec.template.spec.containers[*].name}{"\n"}'
+kubectl logs -n higress-system deploy/higress-controller -c higress-core -f
+# 在另一终端查看；若实际名称不同，替换上面的 higress-core
+kubectl logs -n higress-system deploy/higress-controller -c discovery -f
 # 看Envoy(gateway)日志
 kubectl logs -n higress-system deploy/higress-gateway -f
 # 进入gateway Pod打开Envoy Admin管理接口（非常关键！）
@@ -114,8 +109,8 @@ kubectl exec -it -n higress-system deploy/higress-gateway -- curl 127.0.0.1:1500
 
 **检查点：**
 
-- 部署成功；可以通过 Gateway 资源 + 简单 VirtualService，把一条 host+path 流量转发到一个测试 Deployment；**能从外部访问通**。
-- 能区分：传统 Ingress（K8s 原生，能力弱） vs Higress 推荐的 **Gateway API + Istio 风格 CRD**（VirtualService、DestinationRule）。
+- 部署成功；可以通过 Console 创建 Ingress 路由，把一条 host+path 流量转发到测试服务；**能从外部访问通**。
+- 能区分 Kubernetes Ingress、Kubernetes Gateway API 与 Istio 配置模型；当前先沿用本地 Console 的 Ingress 路线。
 
 >
 > 📌这里只需要**会用**CRD；原理放到下一个任务。
@@ -125,23 +120,23 @@ kubectl exec -it -n higress-system deploy/higress-gateway -- curl 127.0.0.1:1500
 ### Task0‑3：吃透 Higress 配置模型 & 核心 CRD（8–12h；**整个学习周期最重的 P0 任务**）
 
 >
-> Higress 支持两套体系：
+> 先区分用户提交的资源与控制面内部配置，不把 Kubernetes Gateway API 和 Istio API 混为一套规范。
 >
->
-> 1. **K8s Gateway API（官方主推新规范，未来标准，优先学）**：`GatewayClass`、`Gateway`、`HTTPRoute`、`TLSRoute`
-> 2. **兼容 Istio 传统 CRD（存量多，必须会读，但是不建议新项目无脑优先选）**：`VirtualService`、`DestinationRule`
-> 还有**Higress 专属增强 CRD**：`HigressIngress`、`HigressWafRule`、`HigressGlobalRateLimit`、`McpBridge`（对接 Nacos/Apollo 等注册中心，**这个是很多生产环境独有的，一定要看**）。
+> - 本地 Console 学习主线：`Ingress` 及注解、`McpBridge` 服务发现、`WasmPlugin` 插件配置，以及 `Service`、`Secret`、`ConfigMap`。
+> - Kubernetes Gateway API：`GatewayClass`、`Gateway`、`HTTPRoute` 等；先核对部署版本、CRD 和功能开关，不假定所有路由类型都支持。
+> - Istio 配置模型：`VirtualService`、`DestinationRule` 等，用来理解 Core 到 Pilot 的配置转换。是否允许直接提交并生效，以部署配置为准；内部使用这些模型不等于用户必须创建对应 CR。
+> - 不把 `HigressIngress`、`HigressWafRule`、`HigressGlobalRateLimit` 当作本环境已存在的标准资源；先用 `kubectl get crd` 核实。
 
 **学习顺序：**
 
-1. Gateway API：Gateway（监听端口、证书、安全设置） → HTTPRoute（路由、匹配、重写、超时、重试）；
-2. 再学 VirtualService/DestinationRule：理解 “为什么很多存量用它；和 Gateway API 的映射关系；不要死磕 Istio 原生文档，**只看 Higress 官方对这两个 CRD 的支持说明**”；
+1. 先用 Console 创建 Ingress 路由，理解域名、路径、目标服务和注解；学习 McpBridge 与 WasmPlugin；
+2. 再跟踪 Core 转换、Pilot 生成和 Envoy 接受配置；需要 Gateway API 时再按版本支持范围做实验；
 3. 重点业务能力（生产高频）：
    - 域名、路径、header 匹配；URI 重写；超时、重试；
    - 流量灰度 / 按权重分流；**这个是网关最常变更的操作，必须亲手在测试环境跑通 Demo**；
-   - 证书管理：Secret、自动证书、higress‑cert‑agent；
+   - 证书管理：TLS Secret、域名绑定及实际部署的证书管理机制；
    - 限流：**Higress 全局限流 vs Envoy 本地限流；区分清楚！**（很多新手混淆）；
-   - WAF 基础：内置规则、黑白名单，`HigressWafRule`；
+   - WAF 基础：对应插件的规则、黑白名单及 WasmPlugin 配置；
    - McpBridge：对接外部服务注册中心（如果你们业务用到 Nacos，这块必须吃透；这是 Higress 非常高频的落地场景，**Istio 没有这个东西**）。
 
 >
@@ -150,7 +145,7 @@ kubectl exec -it -n higress-system deploy/higress-gateway -- curl 127.0.0.1:1500
 **检查点：**
 
 - 在测试集群完整跑通：**一个域名 → 两条 HTTPRoute，80% 流量到 v1，20% 到 v2；配置 HTTPS 证书；加一个路径重写；设置连接 & 请求超时；配置一个 QPS 限流；**
-- 修改一个路由，**观察 controller 日志确认配置被接受；再通过 envoy admin /config_dump 看到新规则已经推送到 Envoy**；完整走完「apply → controller 处理 → xDS 下发 → Enoy 生效」链路；
+- 修改一个路由，**观察 controller 日志确认配置被接受；再通过 envoy admin /config_dump 看到新规则已经推送到 Envoy**；完整走完「apply → Core 转换 → Pilot 下发 → Envoy 接受并生效」链路；
 
 >
 > ✨这个动作，是以后排查 “配置改了为什么不生效” 的标准流程，**必须亲手走一遍**。
@@ -164,12 +159,12 @@ kubectl exec -it -n higress-system deploy/higress-gateway -- curl 127.0.0.1:1500
 > 学习**只需要这些名词，按顺序：**
 >
 >
-> - xDS 协议：LDS/RDS/CDS/EDS（只需要知道每个 DS 管什么：Listener、Route、Cluster、Endpoint；**不用自己实现 xDS 客户端**；只需要知道：**controller 就是生成这些资源，推给 Envoy**）；
+> - xDS 协议：LDS/RDS/CDS/EDS（只需要知道每个 DS 管什么：Listener、Route、Cluster、Endpoint；**不用自己实现 xDS 客户端**；只需要知道：**Core 转换入口配置，Pilot 生成这些 xDS 资源并推给 Envoy**）；
 > - Listener（监听器：端口、TLS、FilterChain）；
 > - RouteConfiguration（路由表，VirtualHost、Route 条目；**你在 CR 里写的 host/path，最终都会翻译成这里**）；
 > - Cluster（后端集群，对应 Service；连接池、超时、健康检查、负载均衡策略）；
 > - Endpoint（后端真实 Pod IP；EDS 动态下发）；
-> - 核心内置 Filter 链：`envoy.http_connection_manager`，以及 Higress 封装的**higress‑filter（比如限流、WAF、鉴权等，大多是基于 Envoy Lua Filter、ExtAuth、AccessLog 等封装，**现阶段只要知道 “这些 Filter 由 controller 根据 CR 自动注入，一般不用手写”**）；
+> - 核心 Filter 链：HTTP connection manager、HTTP filters 和 router；Higress 的鉴权、限流等扩展常通过 Wasm 插件实现，结合 WasmPlugin 与 ECDS 配置理解，不能笼统称为 Lua 封装；
 > - **Admin 接口使用：/config_dump、/clusters、/listeners、/stats、/log**；**这 5 个 URL 是排障神器，必须每个都点开看，能读懂输出的大致结构**。
 
 **禁止 P0 阶段做：**
@@ -210,7 +205,7 @@ kubectl exec -it -n higress-system deploy/higress-gateway -- curl 127.0.0.1:1500
 
 ### Task1‑2：生产运维、变更流程、回滚、高可用（4h）
 
-- Higress‑controller：**单副本 vs 多副本；注意：controller 是 active‑standby，不是多活！只有一个实例在处理 xDS 推送；了解它的 Leader 选举机制、故障表现**；这个是上线最大风险点之一，很多人不知道；
+- Higress 控制面：分别理解 Core 与 Pilot 的多副本行为。不能把整个 Controller 笼统描述为“只有 leader 能推 xDS”；部分任务使用 leader 选举不等于所有配置生成和 xDS 服务都为主备。检查实际副本、Gateway 的 xDS 连接、滚动更新和故障重连表现；
 - higress‑gateway（Envoy）：**无状态，可以水平扩缩容；多 Pod 之间没有共享状态；全局限流是 “通过外部 Redis”，不是 Envoy 本地，这点要区分**；
 - 变更最佳实践：**先在测试验证 CR；生产用 GitOps 管理 yaml；每次变更只改一条规则；变更前后检查 controller 日志 + envoy config_dump；准备好 “kubectl delete” 快速回滚方案；严禁直接操作 Envoy 静态配置！**
 - 健康检查、就绪探针、启动顺序；滚动更新时流量丢失风险；
@@ -228,7 +223,7 @@ kubectl exec -it -n higress-system deploy/higress-gateway -- curl 127.0.0.1:1500
 >
 > ❌ **P1 不要去学：Istio sidecar 注入、AuthorizationPolicy 完整网格策略、Citadel、 istiod 内部推送队列、流量镜像完整网格方案、Kiali、Jaeger 在 Istio 里的全套部署。这些和 Higress 入口网关职责几乎无关，投入产出极低。**
 
-**检查点：**能回答：**“我的集群里没有 istiod，为什么还能 apply VirtualService？”—— 因为 CRD 只是 K8s 自定义资源定义，**只要 higress‑controller 监听了这个 CRD 类型，不需要 Istio 组件。**
+**检查点：**能回答：**“我的集群里没有 istiod，为什么还能 apply VirtualService？”—— 因为 CRD 只是 K8s 自定义资源定义，**API Server 安装对应 CRD 后才能接收资源；资源生效还依赖控制面实际监听和支持。Higress 自带 Pilot/discovery，因此无需另装完整 Istio，但不能据此说没有使用 Istio 组件。**
 
 ### Task1‑4：高频故障案例学习 & 排障 SOP（4–6h；刷官方 FAQ + GitHub issues + 公开落地文章）
 
@@ -237,7 +232,7 @@ kubectl exec -it -n higress-system deploy/higress-gateway -- curl 127.0.0.1:1500
 >
 > 1. kubectl apply 有没有语法错误？ → kubectl get events 看 K8s 事件；
 > 2. higress‑controller 日志：有没有 “解析 CR 失败、校验失败、丢弃配置”；**很多配置不生效是在这里被拒绝，用户却不知道；**
-> 3. 确认 controller 把配置生成出来了 → envoy admin `/config_dump` 检查 RDS/CDS 是否存在规则；
+> 3. 确认 Core 转换与 Pilot 推送正常，检查 ACK/NACK → Envoy admin `/config_dump` 检查有效的 RDS/CDS 配置，不能把失败配置或 warming 配置当作已生效；
 > 4. 如果配置已经在 Envoy 里：看访问日志、envoy `/stats` 指标，定位是路由没匹配到、还是上游问题；
 > 5. 网络层：安全组、service、后端 Pod 连通性。
 
@@ -281,7 +276,7 @@ kubectl exec -it -n higress-system deploy/higress-gateway -- curl 127.0.0.1:1500
 - Higress 二次开发，自己扩展 Controller。
 
 >
-> ⚠️一个很重要的心理建设：**很多人以为 “用好 Higress = 精通 Istio+Envoy”；现实是，对于入口网关运维，Envoy 懂必要的数据面概念足够；Istio 只需要懂 API 规范，不需要吃透完整服务网格实现。把宝贵的一个月，优先砸在 Higress 自身、K8s、可观测、真实生产场景上。**
+> ⚠️一个很重要的心理建设：**很多人以为 “用好 Higress = 精通 Istio+Envoy”；现实是，对于入口网关运维，Envoy 懂必要的数据面概念足够；Istio 先掌握相关 API、Pilot 配置生成及 xDS 下发，不需要吃透完整服务网格实现。把宝贵的一个月，优先砸在 Higress 自身、K8s、可观测、真实生产场景上。**
 
 ---
 
@@ -294,7 +289,7 @@ kubectl exec -it -n higress-system deploy/higress-gateway -- curl 127.0.0.1:1500
    - [https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/http/http_connection_management](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/http/http_connection_management)
    - Admin 接口文档：[https://www.envoyproxy.io/docs/envoy/latest/operations/admin](https://www.envoyproxy.io/docs/envoy/latest/operations/admin)
 4. Gateway API 官方：[https://gateway-api.sigs.k8s.io/](https://gateway-api.sigs.k8s.io/)
-5. Istio API（仅 proto 定义，不要看 istiod 实现）：[https://github.com/istio/api](https://github.com/istio/api)
+5. Istio API（先看配置定义，需要调试时再阅读 Higress 使用的 Pilot 实现）：[https://github.com/istio/api](https://github.com/istio/api)
 
 >
 > ❌ 不推荐：上来就买《Istio 服务网格权威指南》这类厚书；**对你当前目标严重超纲，性价比很低**。
